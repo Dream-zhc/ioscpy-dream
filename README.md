@@ -3,6 +3,7 @@
 ## ToDo
 - [ ] Add Authentication & Authorization
 - [ ] https://github.com/lautarovculic/ioscpy/issues/4
+- [ ] Performance optimization
 
 A macOS and Linux CLI that mirrors and controls a jailbroken iPhone over USB.
 
