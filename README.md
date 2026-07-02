@@ -4,6 +4,7 @@
 - [ ] Add Authentication & Authorization
 - [ ] https://github.com/lautarovculic/ioscpy/issues/4
 - [ ] Performance optimization
+- [ ] Obtain documentation to consider the possibility of providing support for Windows with a GUI as well
 
 A macOS and Linux CLI that mirrors and controls a jailbroken iPhone over USB.
 
@@ -155,6 +156,7 @@ Devices:
 | roothide | iPhone11,2 | 15.5 | ElleKit |
 | roothide | iPhone10,4 | 16.7.12 | ElleKit |
 | roothide | iPhone10,3 | 16.7.10 | ElleKit |
+| roothide | iPhone14 | 16.3 | ------- |
 
 ioscpy is developed and tested on the devices above. I don't have a rootful device
 or every iOS version on hand, so coverage by layout is incomplete:
