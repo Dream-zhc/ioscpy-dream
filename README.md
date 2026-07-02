@@ -212,5 +212,5 @@ It is not for Windows, and not for iPhones that are not jailbroken.
 ## Author / Contributors
 
 - [Lautaro Villarreal Culic'](https://lautarovculic.com)
-- [Moamen Yasser](https://www.linkedin.com/in/ymuu/)
+- [Moamen Yasser](https://ymuu.me/)
 - [Alessio Amatucci](https://github.com/Alexius22)
