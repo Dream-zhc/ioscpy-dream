@@ -5,6 +5,7 @@
 - [ ] https://github.com/lautarovculic/ioscpy/issues/4
 - [ ] Performance optimization
 - [ ] Obtain documentation to consider the possibility of providing support for Windows with a GUI as well
+- [ ] Obtain documentation to consider the possibility of make `ioscpy` wireless (BLE, Wi-Fi)
 
 A macOS and Linux CLI that mirrors and controls a jailbroken iPhone over USB.
 
