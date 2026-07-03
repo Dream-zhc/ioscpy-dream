@@ -6,6 +6,7 @@
 - [ ] Performance optimization
 - [ ] Research: Providing support for Windows with a GUI as well
 - [ ] Research: Make `ioscpy` wireless (BLE, Wi-Fi)
+- [ ] Custom Buttons Actions (Macros)
 
 A macOS and Linux CLI that mirrors and controls a jailbroken iPhone over USB.
 
