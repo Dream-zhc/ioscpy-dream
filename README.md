@@ -1,11 +1,13 @@
 # ioscpy
 
 ## ToDo
+- [ ] https://github.com/lautarovculic/ioscpy/pull/8
+- [ ] https://github.com/lautarovculic/ioscpy/issues/7
+- [ ] Research: Providing support for Windows with a GUI as well
 - [ ] Add Authentication & Authorization
 - [ ] https://github.com/lautarovculic/ioscpy/issues/4
-- [ ] Performance optimization
-- [ ] Research: Providing support for Windows with a GUI as well
 - [ ] Research: Make `ioscpy` wireless (BLE, Wi-Fi)
+- [ ] Performance optimization
 - [ ] Custom Buttons Actions (Macros)
 
 A macOS and Linux CLI that mirrors and controls a jailbroken iPhone over USB.
