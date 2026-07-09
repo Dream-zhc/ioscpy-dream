@@ -1,7 +1,6 @@
 # ioscpy
 
 ## ToDo
-- [ ] https://github.com/lautarovculic/ioscpy/pull/8
 - [ ] https://github.com/lautarovculic/ioscpy/issues/7
 - [ ] Research: Providing support for Windows with a GUI as well
 - [ ] Add Authentication & Authorization
