@@ -3,7 +3,7 @@
 ## ToDo
 - [ ] https://github.com/lautarovculic/ioscpy/issues/7
 - [ ] Research: Providing support for Windows with a GUI as well
-- [ ] Add Authentication & Authorization
+- [ ] Add Authentication & Authorization (Reserved, Author will implement this fully)
 - [ ] https://github.com/lautarovculic/ioscpy/issues/4
 - [ ] Research: Make `ioscpy` wireless (BLE, Wi-Fi)
 - [ ] Performance optimization
