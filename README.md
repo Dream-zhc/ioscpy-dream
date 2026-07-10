@@ -2,6 +2,7 @@
 
 ## ToDo
 - [ ] https://github.com/lautarovculic/ioscpy/issues/7
+- [ ] Screen Recording button in sidepanel.
 - [ ] Research: Providing support for Windows with a GUI as well
 - [ ] Add Authentication & Authorization (Reserved, Author will implement this fully)
 - [ ] https://github.com/lautarovculic/ioscpy/issues/4
