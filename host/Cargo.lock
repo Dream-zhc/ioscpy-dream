@@ -590,6 +590,7 @@ dependencies = [
  "clap",
  "cocoa",
  "ctrlc",
+ "getrandom 0.3.4",
  "minifb",
  "objc",
  "openh264",

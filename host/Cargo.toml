@@ -38,8 +38,19 @@ cocoa = "0.25"
 # openh264 is the software H.264 decoder used off macOS, since the VideoToolbox
 # shim in h264_decoder.m is mac-only.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 openh264 = "0.9"
+
+# Linux / other Unix (not macOS): native Wayland clipboard via wl-clipboard-rs.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+
+# Windows: Win32 clipboard (the wayland-data-control feature pulls wl-clipboard-rs,
+# which doesn't build here), plus getrandom for the handshake nonce (no /dev/urandom).
+[target.'cfg(target_os = "windows")'.dependencies]
+arboard = { version = "3", default-features = false }
+# 0.3 (uses getrandom::fill) aligns with the version already in the tree, avoiding
+# an extra major line in Cargo.lock.
+getrandom = "0.3"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"
