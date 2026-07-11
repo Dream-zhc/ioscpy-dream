@@ -5,9 +5,7 @@
 - [ ] Screen Recording button in sidepanel.
 - [ ] Research: Providing support for Windows with a GUI as well
 - [ ] Add Authentication & Authorization (Reserved, Author will implement this fully)
-- [ ] https://github.com/lautarovculic/ioscpy/issues/4
 - [ ] Research: Make `ioscpy` wireless (BLE, Wi-Fi)
-- [ ] Performance optimization
 - [ ] Custom Buttons Actions (Macros)
 
 A macOS, Linux, and Windows CLI that mirrors and controls a jailbroken iPhone over USB.
