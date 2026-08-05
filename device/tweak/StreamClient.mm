@@ -49,12 +49,17 @@ static uint64_t clipHash(NSString *t) {
 @implementation IOSPYStreamClient {
     int _fd;
     dispatch_queue_t _captureQueue;
+    dispatch_queue_t _sendQueue;
     dispatch_source_t _timer;
     dispatch_queue_t _clipQueue;   // ALL UIPasteboard access happens here, off-main
     dispatch_source_t _clipTimer;
     IOSPYH264Encoder *_encoder;    // created lazily on the capture queue
+    NSLock *_socketWriteLock;      // prevents frame/control write interleaving
     uint8_t _codec;                // 0 = MJPEG, 1 = H.264 (host's request)
     BOOL _needKeyframe;            // force an H.264 keyframe on the next frame
+    NSUInteger _h264InFlight;
+    NSUInteger _sendBacklog;
+    uint64_t _encoderEpoch;
     IOSPYStreamConfig _config;
 
     double _streamStartMs;
@@ -84,7 +89,9 @@ static uint64_t clipHash(NSString *t) {
         _config = IOSPYParseStreamConfig(nil);
         _codec = _config.codec;
         _captureQueue = dispatch_queue_create("com.ioscpy.capture", DISPATCH_QUEUE_SERIAL);
+        _sendQueue = dispatch_queue_create("com.ioscpy.send", DISPATCH_QUEUE_SERIAL);
         _clipQueue = dispatch_queue_create("com.ioscpy.clip", DISPATCH_QUEUE_SERIAL);
+        _socketWriteLock = [[NSLock alloc] init];
         [self startClipboardObserver];
     }
     return self;
@@ -142,10 +149,12 @@ static uint64_t clipHash(NSString *t) {
     [body appendData:utf8];
     // NEVER write the socket on the main thread. A stalled write would wedge
     // SpringBoard and trip the watchdog. Serialize with capture writes to _fd.
-    dispatch_async(_captureQueue, ^{
+    dispatch_async(_sendQueue, ^{
         int fd = self->_fd;
         if (fd >= 0) {
+            [self->_socketWriteLock lock];
             IOSPYWriteFrame(fd, IOSPYMsgClipboardChanged, IOSPY_CHANNEL_CONTROL, 0, body);
+            [self->_socketWriteLock unlock];
         }
     });
 }
@@ -310,7 +319,10 @@ static uint64_t clipHash(NSString *t) {
         NSLog(@"[ioscpyhook] capture stopped");
     }
     // Release the encoder's hardware session while idle; it lazily rebuilds.
+    _encoderEpoch++;
     [_encoder invalidate];
+    _h264InFlight = 0;
+    _sendBacklog = 0;
 }
 
 - (void)resetStreamStats {
@@ -347,7 +359,14 @@ static uint64_t clipHash(NSString *t) {
     };
     NSData *body = [NSJSONSerialization dataWithJSONObject:stats options:0 error:nil];
     if (body) {
-        IOSPYTryWriteFrame(_fd, IOSPYMsgStats, IOSPY_CHANNEL_CONTROL, 0, body);
+        int fd = _fd;
+        dispatch_async(_sendQueue, ^{
+            if (fd >= 0 && fd == self->_fd) {
+                [self->_socketWriteLock lock];
+                IOSPYTryWriteFrame(fd, IOSPYMsgStats, IOSPY_CHANNEL_CONTROL, 0, body);
+                [self->_socketWriteLock unlock];
+            }
+        });
     }
     _lastStatsMs = now;
     _captureTicks = 0;
@@ -423,8 +442,10 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     _encodeMsTotal += encodeMs;
 
     double sendStart = streamNowMs();
+    [_socketWriteLock lock];
     BOOL sent = IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,
                                 makeVideoFrame(width, height, orientationFlags(), jpeg));
+    [_socketWriteLock unlock];
     _sendMsTotal += streamNowMs() - sendStart;
     if (sent) {
         _sentFrames++;
@@ -436,6 +457,12 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
 - (BOOL)captureAndSendH264:(int)fd {
     if (!IOSPYH264Available()) {
         return NO;
+    }
+    // Bound hardware work. A timer tick that arrives while two frames are still
+    // encoding is stale by definition, so drop it instead of building latency.
+    if (_h264InFlight >= 2) {
+        _droppedFrames++;
+        return YES;
     }
     if (!_encoder) {
         _encoder = [[IOSPYH264Encoder alloc] init];
@@ -451,42 +478,92 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     _capturedFrames++;
     _captureMsTotal += captureMs;
     int fps = MAX(_config.target_fps, 1);
-    BOOL isKey = NO;
+    BOOL forceKeyframe = _needKeyframe;
+    uint64_t epoch = _encoderEpoch;
     double encodeStart = streamNowMs();
-    NSData *avcc = [_encoder encodeSurface:surface
-                                     width:width
-                                    height:height
-                                       fps:fps
-                                   bitrate:_config.bitrate_bps
-                          keyframeInterval:MAX(_config.keyframe_interval_frames, 1)
-                             forceKeyframe:_needKeyframe
-                                  keyframe:&isKey];
-    double encodeMs = streamNowMs() - encodeStart;
-    if (!avcc) {
+    _h264InFlight++;
+    BOOL submitted = [_encoder submitSurface:surface
+                                       width:width
+                                      height:height
+                                         fps:fps
+                                     bitrate:_config.bitrate_bps
+                            keyframeInterval:MAX(_config.keyframe_interval_frames, 1)
+                               forceKeyframe:forceKeyframe
+                                  completion:^(NSData *avcc, BOOL isKey, BOOL hardError) {
+        double encodeMs = streamNowMs() - encodeStart;
+        dispatch_async(self->_captureQueue, ^{
+            if (epoch != self->_encoderEpoch) {
+                return;
+            }
+            if (self->_h264InFlight > 0) {
+                self->_h264InFlight--;
+            }
+            if (hardError) {
+                self->_droppedFrames++;
+                self->_codec = IOSPY_VIDEO_CODEC_MJPEG;
+                self->_needKeyframe = YES;
+                NSLog(@"[ioscpyhook] asynchronous H.264 encode failed; using MJPEG");
+                return;
+            }
+            if (avcc.length == 0) {
+                self->_droppedFrames++;
+                if (forceKeyframe) {
+                    self->_needKeyframe = YES;
+                }
+                return;
+            }
+
+            self->_encodedFrames++;
+            self->_encodeMsTotal += encodeMs;
+            if (isKey) {
+                self->_needKeyframe = NO;
+            }
+
+            // Keep the socket queue short. If two encoded frames are already
+            // waiting, discard this one and force a new keyframe so the decoder
+            // can recover without replaying stale inter-frames.
+            if (self->_sendBacklog >= 2) {
+                self->_droppedFrames++;
+                self->_needKeyframe = YES;
+                return;
+            }
+            self->_sendBacklog++;
+            uint32_t flags = IOSPY_VIDEO_FLAG_H264 | orientationFlags();
+            if (isKey) {
+                flags |= IOSPY_VIDEO_FLAG_KEYFRAME | IOSPY_VIDEO_FLAG_CONFIG;
+            }
+            NSData *frame = makeVideoFrame(width, height, flags, avcc);
+            dispatch_async(self->_sendQueue, ^{
+                double sendStart = streamNowMs();
+                [self->_socketWriteLock lock];
+                BOOL sent = fd >= 0 && fd == self->_fd &&
+                    IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0, frame);
+                [self->_socketWriteLock unlock];
+                double sendMs = streamNowMs() - sendStart;
+                dispatch_async(self->_captureQueue, ^{
+                    if (epoch != self->_encoderEpoch) {
+                        return;
+                    }
+                    if (self->_sendBacklog > 0) {
+                        self->_sendBacklog--;
+                    }
+                    self->_sendMsTotal += sendMs;
+                    if (sent) {
+                        self->_sentFrames++;
+                    } else {
+                        self->_droppedFrames++;
+                        self->_needKeyframe = YES;
+                    }
+                });
+            });
+        });
+    }];
+    if (!submitted) {
+        if (_h264InFlight > 0) {
+            _h264InFlight--;
+        }
         _droppedFrames++;
         return NO; // hard failure, fall back to MJPEG
-    }
-    if (avcc.length == 0) {
-        _droppedFrames++;
-        return YES; // dropped this tick, encoder still healthy
-    }
-    _encodedFrames++;
-    _encodeMsTotal += encodeMs;
-    if (isKey) {
-        _needKeyframe = NO;
-    }
-    uint32_t flags = IOSPY_VIDEO_FLAG_H264 | orientationFlags();
-    if (isKey) {
-        flags |= IOSPY_VIDEO_FLAG_KEYFRAME | IOSPY_VIDEO_FLAG_CONFIG;
-    }
-    double sendStart = streamNowMs();
-    BOOL sent = IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,
-                                makeVideoFrame(width, height, flags, avcc));
-    _sendMsTotal += streamNowMs() - sendStart;
-    if (sent) {
-        _sentFrames++;
-    } else {
-        _droppedFrames++;
     }
     return YES;
 }

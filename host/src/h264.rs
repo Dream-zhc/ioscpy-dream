@@ -26,10 +26,9 @@ mod ffi {
     extern "C" {
         pub fn ioscpy_h264_decoder_new() -> *mut Decoder;
         pub fn ioscpy_h264_decoder_free(dec: *mut Decoder);
-        pub fn ioscpy_h264_decoder_decode(
+        pub fn ioscpy_h264_decoder_decode(dec: *mut Decoder, avcc: *const u8, len: usize) -> c_int;
+        pub fn ioscpy_h264_decoder_take(
             dec: *mut Decoder,
-            avcc: *const u8,
-            len: usize,
             out_bgra: *mut *const u8,
             out_w: *mut c_int,
             out_h: *mut c_int,
@@ -56,19 +55,16 @@ impl H264Decoder {
 
     /// Decode one AVCC frame (4-byte length-prefixed NALs, may carry SPS/PPS).
     pub fn decode(&mut self, avcc: &[u8]) -> Decoded {
+        let submitted =
+            unsafe { ffi::ioscpy_h264_decoder_decode(self.inner, avcc.as_ptr(), avcc.len()) };
+        if submitted < 0 {
+            return Decoded::Failed;
+        }
+
         let mut out_ptr: *const u8 = std::ptr::null();
         let mut w: i32 = 0;
         let mut h: i32 = 0;
-        let rc = unsafe {
-            ffi::ioscpy_h264_decoder_decode(
-                self.inner,
-                avcc.as_ptr(),
-                avcc.len(),
-                &mut out_ptr,
-                &mut w,
-                &mut h,
-            )
-        };
+        let rc = unsafe { ffi::ioscpy_h264_decoder_take(self.inner, &mut out_ptr, &mut w, &mut h) };
         match rc {
             1 if !out_ptr.is_null() && w > 0 && h > 0 => {
                 let width = w as usize;

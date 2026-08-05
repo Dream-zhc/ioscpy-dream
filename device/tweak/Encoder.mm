@@ -121,51 +121,48 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
     [dst appendBytes:nal length:len];
 }
 
-- (NSData *)encodeSurface:(IOSurfaceRef)surface
-                    width:(int)width
-                   height:(int)height
-                      fps:(int)fps
-                  bitrate:(uint32_t)bitrate
-         keyframeInterval:(int)keyframeInterval
-            forceKeyframe:(BOOL)forceKeyframe
-                 keyframe:(BOOL *)outKeyframe {
-    if (outKeyframe) {
-        *outKeyframe = NO;
-    }
+- (BOOL)submitSurface:(IOSurfaceRef)surface
+                 width:(int)width
+                height:(int)height
+                   fps:(int)fps
+               bitrate:(uint32_t)bitrate
+      keyframeInterval:(int)keyframeInterval
+         forceKeyframe:(BOOL)forceKeyframe
+            completion:(IOSPYH264Completion)completion {
     if (!surface || width < 2 || height < 2) {
-        return nil;
+        return NO;
     }
     if (![self ensureSessionForWidth:width
                               height:height
                                  fps:fps
                              bitrate:bitrate
                     keyframeInterval:keyframeInterval]) {
-        return nil;
+        return NO;
     }
 
     CVPixelBufferRef pixelBuffer = NULL;
     CVReturn cr = CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, surface, NULL, &pixelBuffer);
     if (cr != kCVReturnSuccess || !pixelBuffer) {
-        return nil;
+        return NO;
     }
 
     CMTime pts = CMTimeMake(_pts++, fps);
     NSDictionary *frameProps =
         forceKeyframe ? @{(id)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
 
-    __block NSData *result = nil;
-    __block BOOL isKey = NO;
-    __block BOOL hardError = NO;
+    IOSPYH264Completion done = [completion copy];
 
     OSStatus es = VTCompressionSessionEncodeFrameWithOutputHandler(
         _session, pixelBuffer, pts, kCMTimeInvalid, (__bridge CFDictionaryRef)frameProps, NULL,
         ^(OSStatus status, VTEncodeInfoFlags infoFlags, CMSampleBufferRef sample) {
+          @autoreleasepool {
             if (status != noErr) {
-                hardError = YES;
+                if (done) done(nil, NO, YES);
                 return;
             }
             if (!sample || (infoFlags & kVTEncodeInfo_FrameDropped)) {
-                return; // dropped this tick, not an error
+                if (done) done([NSData data], NO, NO);
+                return;
             }
 
             // A sample is a keyframe unless it's explicitly marked not-sync.
@@ -181,8 +178,6 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
                     key = NO;
                 }
             }
-            isKey = key;
-
             NSMutableData *out = [NSMutableData data];
 
             // On a keyframe, lead with the parameter sets so the stream is
@@ -208,8 +203,8 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
                 }
                 if (count == 0 || appended != count) {
                     NSLog(@"[ioscpyhook] incomplete H.264 parameter sets; retrying keyframe");
-                    isKey = NO;
-                    return; // leaves result nil, caller treats it as a dropped tick
+                    if (done) done([NSData data], NO, NO);
+                    return;
                 }
             }
 
@@ -223,30 +218,19 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
                     [out appendData:nalData];
                 }
             }
-            result = out;
+            if (done) done(out, key, NO);
+          }
         });
 
-    if (es != noErr) {
-        CVPixelBufferRelease(pixelBuffer);
-        NSLog(@"[ioscpyhook] H.264 encode enqueue failed (%d)", (int)es);
-        return nil;
-    }
-
-    // Flush so the handler has run and order is preserved before we return. Only
-    // then are hardError and result settled.
-    VTCompressionSessionCompleteFrames(_session, kCMTimeInvalid);
+    // VideoToolbox retains the image buffer until the asynchronous encode is
+    // complete, so the caller can release its reference immediately.
     CVPixelBufferRelease(pixelBuffer);
 
-    if (hardError) {
-        NSLog(@"[ioscpyhook] H.264 encode failed");
-        return nil;
+    if (es != noErr) {
+        NSLog(@"[ioscpyhook] H.264 encode enqueue failed (%d)", (int)es);
+        return NO;
     }
-    if (outKeyframe) {
-        *outKeyframe = isKey;
-    }
-    // No data this tick is a drop, not a failure. Hand back empty so the caller
-    // skips the frame but keeps using H.264.
-    return result ?: [NSData data];
+    return YES;
 }
 
 @end

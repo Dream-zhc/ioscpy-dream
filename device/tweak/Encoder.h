@@ -21,6 +21,8 @@ BOOL IOSPYH264Available(void);
 }
 #endif
 
+typedef void (^IOSPYH264Completion)(NSData *data, BOOL keyframe, BOOL hardError);
+
 @interface IOSPYH264Encoder : NSObject
 
 // Encode a BGRA IOSurface to H.264. The session is created lazily and recreated
@@ -28,19 +30,18 @@ BOOL IOSPYH264Available(void);
 // NAL units); on a keyframe the SPS/PPS parameter sets are prepended (also AVCC
 // framed) so the host can build its decoder from the stream alone.
 //
-// Returns:
-//   nil          the session could not be created or the encode errored, so the
-//                caller should fall back to MJPEG.
-//   empty data   the frame was dropped by the encoder this tick (skip it).
-//   data         the encoded frame; *outKeyframe says whether it's a keyframe.
-- (NSData *)encodeSurface:(IOSurfaceRef)surface
-                    width:(int)width
-                   height:(int)height
-                      fps:(int)fps
-                  bitrate:(uint32_t)bitrate
-         keyframeInterval:(int)keyframeInterval
-            forceKeyframe:(BOOL)forceKeyframe
-                 keyframe:(BOOL *)outKeyframe;
+// The frame is submitted without waiting for the hardware encoder. Returns NO
+// only when submission/session creation failed synchronously. `completion` runs
+// later with encoded AVCC bytes, an empty buffer for an encoder drop, or
+// `hardError=YES` when the session should be rebuilt/fallen back.
+- (BOOL)submitSurface:(IOSurfaceRef)surface
+                 width:(int)width
+                height:(int)height
+                   fps:(int)fps
+               bitrate:(uint32_t)bitrate
+      keyframeInterval:(int)keyframeInterval
+         forceKeyframe:(BOOL)forceKeyframe
+            completion:(IOSPYH264Completion)completion;
 
 // Tear down the underlying session (e.g. when the stream stops).
 - (void)invalidate;
