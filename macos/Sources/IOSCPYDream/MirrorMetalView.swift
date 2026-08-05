@@ -139,10 +139,11 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
             colorSpace: colorSpace
         )
         commandBuffer.present(drawable)
-        commandBuffer.addCompletedHandler { [weak self] _ in
-            DispatchQueue.main.async { self?.onFramePresented?() }
-        }
         commandBuffer.commit()
+        // Presentation telemetry must not enqueue another main-thread closure
+        // for every frame. The counter is thread-safe and this draw callback is
+        // already synchronized with MTKView's display cadence.
+        onFramePresented?()
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}

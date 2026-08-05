@@ -104,10 +104,11 @@ static IOSurfaceRef createBGRASurface(int width, int height) {
     return IOSurfaceCreate((__bridge CFDictionaryRef)props);
 }
 
-// Two slots match StreamClient's maximum of two asynchronous H.264 frames in
-// flight. A slot is not reused until VideoToolbox has invoked the completion
-// callback, preventing the render server from overwriting a frame still being
-// encoded.
+// High-resolution VideoToolbox sessions have several frames of pipeline latency
+// even when their throughput is capable of 120 FPS. Two slots artificially
+// capped the 2160p path around 50 FPS. Six slots let the hardware pipeline stay
+// full while StreamClient still bounds latency and drops stale work.
+static const int kCaptureSlotCount = 6;
 typedef struct {
     IOSurfaceRef source;
     IOSurfaceRef scaled;
@@ -118,13 +119,13 @@ typedef struct {
     BOOL busy;
 } IOSPYCaptureSlot;
 
-static IOSPYCaptureSlot gCaptureSlots[2] = {};
+static IOSPYCaptureSlot gCaptureSlots[kCaptureSlotCount] = {};
 static os_unfair_lock gCapturePoolLock = OS_UNFAIR_LOCK_INIT;
 
 static int acquireCaptureSlot(int sourceW, int sourceH, int targetW, int targetH) {
     os_unfair_lock_lock(&gCapturePoolLock);
     int token = -1;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < kCaptureSlotCount; i++) {
         IOSPYCaptureSlot *slot = &gCaptureSlots[i];
         if (slot->busy) {
             continue;
@@ -159,7 +160,7 @@ static int acquireCaptureSlot(int sourceW, int sourceH, int targetW, int targetH
 }
 
 void IOSPYReleaseCaptureSurface(int token) {
-    if (token < 0 || token >= 2) {
+    if (token < 0 || token >= kCaptureSlotCount) {
         return;
     }
     os_unfair_lock_lock(&gCapturePoolLock);

@@ -76,8 +76,13 @@ BOOL IOSPYHardwareVideoAvailable(uint8_t codec) {
     };
 
     CMVideoCodecType codecType = codec == 2 ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
+    NSDictionary *encoderSpec = @{
+        (__bridge NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
     OSStatus s = VTCompressionSessionCreate(kCFAllocatorDefault, width, height,
-                                            codecType, NULL,
+                                            codecType,
+                                            (__bridge CFDictionaryRef)encoderSpec,
                                             (__bridge CFDictionaryRef)srcAttrs, NULL,
                                             NULL, NULL, &_session);
     if (s != noErr || !_session) {
@@ -88,6 +93,10 @@ BOOL IOSPYHardwareVideoAvailable(uint8_t codec) {
 
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    [self setProp:kVTCompressionPropertyKey_MaxFrameDelayCount
+           number:(fps >= 100 ? 6 : 4)];
+    VTSessionSetProperty(_session, kVTCompressionPropertyKey_MaximizePowerEfficiency,
+                         kCFBooleanFalse);
     // High profile gives screen text and gradients better quality per bit than
     // Baseline. All supported host decoders use VideoToolbox/OpenH264 and accept
     // it; AutoLevel lets the hardware choose the level required by 120 FPS.
@@ -101,6 +110,9 @@ BOOL IOSPYHardwareVideoAvailable(uint8_t codec) {
     // screen quality, so do not override the hardware's real-time scheduler.
     if (codec == 2 && fps < 90) {
         [self setProp:kVTCompressionPropertyKey_Quality real:0.90];
+    } else if (fps >= 90) {
+        CFStringRef speedKey = CFSTR("PrioritizeEncodingSpeedOverQuality");
+        VTSessionSetProperty(_session, speedKey, kCFBooleanTrue);
     }
 
     // Refresh a keyframe at least every few seconds (and bound by frame count) so

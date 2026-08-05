@@ -21,14 +21,23 @@ enum VideoCodec: UInt8, Codable, CaseIterable, Identifiable {
 struct VideoSettings: Codable, Equatable {
     var codec: VideoCodec = .h264
     var targetFPS: Int = 120
-    var maxDimension: Int = 2160
-    var bitrateMbps: Int = 40
+    var maxDimension: Int = 4096
+    var bitrateMbps: Int = 45
     var keyframeSeconds: Int = 1
 
-    /// USB-first preset based on the proven 0.2.0-dream.3 pipeline. H.264 at
-    /// 2160 long-edge and 40 Mbps keeps the device encoder inside its 120 FPS
-    /// real-time path while remaining visually lossless for UI/text content.
+    /// Native-resolution H.264 avoids the synchronous VTPixelTransfer scaling
+    /// stage. On the target iPhone this is the only profile that can improve
+    /// quality and capture cadence at the same time; the encoder is separately
+    /// pipelined and bounded on the device.
     static let extreme = VideoSettings()
+
+    static let compatibility120 = VideoSettings(
+        codec: .h264,
+        targetFPS: 120,
+        maxDimension: 2160,
+        bitrateMbps: 40,
+        keyframeSeconds: 1
+    )
 
     static let nativeHEVC = VideoSettings(
         codec: .hevc,
@@ -111,7 +120,7 @@ struct AppPreferences: Codable, Equatable {
 }
 
 struct PersistedState: Codable {
-    var version: Int = 2
+    var version: Int = 3
     var preferences = AppPreferences()
     var devices: [DeviceProfile] = []
 }
@@ -119,9 +128,18 @@ struct PersistedState: Codable {
 struct RuntimeStats: Equatable {
     var receiveFPS: Double = 0
     var presentFPS: Double = 0
+    var sourceFPS: Double = 0
+    var captureFPS: Double = 0
+    var encodeFPS: Double = 0
     var bitrateMbps: Double = 0
     var latencyMs: Double = 0
     var droppedFrames: UInt64 = 0
+    var captureMs: Double = 0
+    var encodeMs: Double = 0
+    var sendMs: Double = 0
+    var effectiveDimension: Int = 0
+    var encodeInFlight: Int = 0
+    var sendBacklog: Int = 0
     var transport: String = ""
 }
 
@@ -179,13 +197,12 @@ final class SettingsStore: ObservableObject {
     }
 
     private static func migrate(_ input: PersistedState) -> PersistedState {
-        guard input.version < 2 else { return input }
+        guard input.version < 3 else { return input }
         var output = input
-        output.version = 2
+        output.version = 3
         for index in output.devices.indices {
-            // The first native-App build inherited 60 FPS and experimental HEVC
-            // values from older profiles. Reset once to the verified high-speed
-            // USB preset; subsequent user changes are preserved normally.
+            // Re-apply the verified USB profile once after the first native-App
+            // performance regression. Later user changes remain persistent.
             output.devices[index].video = .extreme
             output.devices[index].deviceFrame = true
         }

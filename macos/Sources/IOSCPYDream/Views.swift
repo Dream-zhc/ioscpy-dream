@@ -280,66 +280,89 @@ struct MirrorView: View {
     @ObservedObject var store: SettingsStore
 
     private var device: DeviceProfile? { model.currentDevice }
+    private var cornerRadius: CGFloat { device?.deviceFrame == true ? 42 : 34 }
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Color.black
+        ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(Color.black)
             MirrorRepresentable(model: model)
-                .clipShape(RoundedRectangle(cornerRadius: device?.deviceFrame == true ? 36 : 28, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 .overlay {
                     if device?.deviceFrame == true {
-                        RoundedRectangle(cornerRadius: 36, style: .continuous)
-                            .strokeBorder(Color.black.opacity(0.92), lineWidth: 7)
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .strokeBorder(Color.black.opacity(0.94), lineWidth: 7)
                             .overlay {
-                                RoundedRectangle(cornerRadius: 36, style: .continuous)
+                                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                                     .strokeBorder(.white.opacity(0.16), lineWidth: 0.7)
                             }
                     }
                 }
                 .shadow(color: .black.opacity(0.48), radius: 18, y: 8)
-
-            if model.toolbarVisible {
-                MirrorToolbar(model: model, store: store)
-                    .padding(12)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
-            if store.state.preferences.diagnosticsOverlay {
-                diagnostics
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                    .padding(16)
-            }
         }
-        .contentShape(Rectangle())
-        .animation(.easeOut(duration: 0.18), value: model.toolbarVisible)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .background(Color.clear)
+        .onAppear {
+            AppWindowManager.shared.showMirrorAccessory(model: model, store: store)
+            AppWindowManager.shared.setMirrorAccessoryVisible(model.toolbarVisible)
+        }
+        .onChange(of: model.toolbarVisible) { _, visible in
+            AppWindowManager.shared.setMirrorAccessoryVisible(visible)
+        }
+        .onDisappear {
+            AppWindowManager.shared.hideMirrorAccessory()
+        }
         .ignoresSafeArea()
-    }
-
-    private var diagnostics: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(String(format: "RX %.1f FPS", model.stats.receiveFPS))
-            Text(String(format: "Present %.1f FPS", model.stats.presentFPS))
-            Text(String(format: "%.1f Mbps · RTT %.1f ms", model.stats.bitrateMbps, model.stats.latencyMs))
-            Text(model.stats.transport)
-        }
-        .font(.system(size: 11, weight: .medium, design: .monospaced))
-        .foregroundStyle(.white)
-        .padding(10)
-        .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
-struct MirrorToolbar: View {
+struct MirrorAccessoryBar: View {
     @ObservedObject var model: AppModel
     @ObservedObject var store: SettingsStore
 
     private var device: DeviceProfile? { model.currentDevice }
+    @State private var draggingWindow = false
+
+    private var displayedFPS: Double {
+        model.stats.sourceFPS > 0 ? model.stats.sourceFPS : model.stats.receiveFPS
+    }
 
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 5) {
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 31)
+                .contentShape(Rectangle())
+                .help("拖动镜像窗口")
+                .gesture(
+                    DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                        .onChanged { value in
+                            if !draggingWindow {
+                                draggingWindow = true
+                                AppWindowManager.shared.beginMirrorWindowDrag()
+                            }
+                            AppWindowManager.shared.updateMirrorWindowDrag(translation: value.translation)
+                            model.revealToolbar()
+                        }
+                        .onEnded { _ in
+                            draggingWindow = false
+                            AppWindowManager.shared.endMirrorWindowDrag()
+                        }
+                )
+
+            Text(String(format: "%.0f FPS", displayedFPS))
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(displayedFPS >= 100 ? Color.green : Color.primary)
+                .frame(minWidth: 53, alignment: .leading)
+                .help(String(format: "%@ · %.1f Mbps · RTT %.1f ms",
+                             model.stats.transport,
+                             model.stats.bitrateMbps,
+                             model.stats.latencyMs))
+
+            Divider().frame(height: 22).opacity(0.4)
             toolbarButton("house", help: "主屏幕") { model.systemAction(1) }
             toolbarButton("square.grid.2x2", help: "App 切换器") { model.systemAction(4) }
-            Divider().frame(height: 22).opacity(0.45)
             toolbarButton(device?.alwaysOnTop == true ? "pin.fill" : "pin", help: "置顶") {
                 model.toggleAlwaysOnTop()
             }
@@ -355,6 +378,8 @@ struct MirrorToolbar: View {
         .glassEffect(.regular, in: .capsule)
         .overlay { Capsule().strokeBorder(.white.opacity(0.2), lineWidth: 0.7) }
         .shadow(color: .black.opacity(0.28), radius: 14, y: 6)
+        .frame(width: 390, height: 52)
+        .onHover { model.setPointerInsideAccessory($0) }
     }
 
     private func toolbarButton(_ symbol: String, help: String, action: @escaping () -> Void) -> some View {
@@ -409,10 +434,13 @@ struct SettingsSheet: View {
 
                     Section("极致画质") {
                         HStack {
-                            Button("USB 120 FPS 高性能") {
+                            Button("原生零缩放 120 FPS") {
                                 model.updateCurrentDevice({ $0.video = .extreme }, applyVideo: true)
                             }
-                            Button("原生 HEVC 120 FPS（实验）") {
+                            Button("2160p 兼容 120 FPS") {
+                                model.updateCurrentDevice({ $0.video = .compatibility120 }, applyVideo: true)
+                            }
+                            Button("原生 HEVC（实验）") {
                                 model.updateCurrentDevice({ $0.video = .nativeHEVC }, applyVideo: true)
                             }
                         }
@@ -432,7 +460,7 @@ struct SettingsSheet: View {
                         Picker("VBR 上限", selection: videoBinding(\.bitrateMbps)) {
                             ForEach([25, 35, 45, 60], id: \.self) { Text("\($0) Mbps").tag($0) }
                         }
-                        Text("USB 默认使用经过验证的 H.264、2160 长边、120 FPS、40 Mbps；原生 HEVC 可手动切换。")
+                        Text("默认使用原生分辨率 H.264、120 FPS、45 Mbps，绕过手机端同步缩放；2160p 兼容模式保留为回退项。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -567,7 +595,9 @@ struct MirrorRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: MirrorMetalView, context: Context) {
-        model.attachMirrorView(nsView)
+        // Callbacks and the mailbox are stable for the lifetime of the native
+        // view. Reattaching on every SwiftUI state update needlessly churns the
+        // hot input/render path.
     }
 }
 

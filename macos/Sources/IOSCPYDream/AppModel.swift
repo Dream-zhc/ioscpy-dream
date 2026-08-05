@@ -32,6 +32,7 @@ final class AppModel: ObservableObject {
     private var userDisconnected = false
     private var didLaunch = false
     private var toolbarHideTask: Task<Void, Never>?
+    private var pointerInsideAccessory = false
     private let hostID: String
 
     init() {
@@ -184,8 +185,41 @@ final class AppModel: ObservableObject {
         connected.onStats = { data in
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
             Task { @MainActor [weak self] in
+                guard let self else { return }
+                let windowMs = max((object["window_ms"] as? NSNumber)?.doubleValue ?? 1000, 1)
+                let scale = 1000.0 / windowMs
+                if let captured = object["captured_frames"] as? NSNumber {
+                    self.stats.captureFPS = captured.doubleValue * scale
+                }
+                if let encoded = object["encoded_frames"] as? NSNumber {
+                    self.stats.encodeFPS = encoded.doubleValue * scale
+                }
+                if let sent = object["sent_frames"] as? NSNumber {
+                    self.stats.sourceFPS = sent.doubleValue * scale
+                }
                 if let dropped = object["dropped_frames"] as? NSNumber {
-                    self?.stats.droppedFrames = dropped.uint64Value
+                    self.stats.droppedFrames = dropped.uint64Value
+                }
+                self.stats.captureMs = (object["capture_ms_avg"] as? NSNumber)?.doubleValue ?? 0
+                self.stats.encodeMs = (object["encode_ms_avg"] as? NSNumber)?.doubleValue ?? 0
+                self.stats.sendMs = (object["send_ms_avg"] as? NSNumber)?.doubleValue ?? 0
+                self.stats.effectiveDimension = (object["max_dimension"] as? NSNumber)?.intValue ?? 0
+                self.stats.encodeInFlight = (object["encode_inflight"] as? NSNumber)?.intValue ?? 0
+                self.stats.sendBacklog = (object["send_backlog"] as? NSNumber)?.intValue ?? 0
+
+                if self.stats.sourceFPS > 0, self.stats.sourceFPS < 90 {
+                    NSLog(
+                        "[ioscpy] pipeline cap=%.1f encode=%.1f sent=%.1f capture=%.2fms encode=%.2fms send=%.2fms inFlight=%d backlog=%d max=%d",
+                        self.stats.captureFPS,
+                        self.stats.encodeFPS,
+                        self.stats.sourceFPS,
+                        self.stats.captureMs,
+                        self.stats.encodeMs,
+                        self.stats.sendMs,
+                        self.stats.encodeInFlight,
+                        self.stats.sendBacklog,
+                        self.stats.effectiveDimension
+                    )
                 }
             }
         }
@@ -318,11 +352,22 @@ final class AppModel: ObservableObject {
     func revealToolbar() {
         toolbarVisible = true
         toolbarHideTask?.cancel()
+        guard !pointerInsideAccessory else { return }
         let delay = store.state.preferences.toolbarAutoHideDelay
         toolbarHideTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
             self?.toolbarVisible = false
+        }
+    }
+
+    func setPointerInsideAccessory(_ inside: Bool) {
+        pointerInsideAccessory = inside
+        toolbarHideTask?.cancel()
+        if inside {
+            toolbarVisible = true
+        } else {
+            revealToolbar()
         }
     }
 
@@ -372,12 +417,19 @@ final class AppWindowManager {
     weak var window: NSWindow?
     private var mirrorMode = false
     private var mirrorContentSize = CGSize(width: 393, height: 852)
+    private var accessoryPanel: NSPanel?
+    private var accessoryHostingView: NSHostingView<AnyView>?
+    private var windowObservers: [NSObjectProtocol] = []
+    private var mirrorDragStartOrigin: NSPoint?
 
     func attach(_ window: NSWindow) {
+        if self.window === window { return }
+        removeWindowObservers()
         self.window = window
-        window.isMovableByWindowBackground = true
+        window.isMovableByWindowBackground = !mirrorMode
         window.collectionBehavior = [.fullScreenAuxiliary, .managed]
         window.minSize = NSSize(width: 320, height: 480)
+        installWindowObservers(window)
     }
 
     func setMirrorMode(_ enabled: Bool) {
@@ -390,14 +442,26 @@ final class AppWindowManager {
             window.isOpaque = false
             window.backgroundColor = .clear
             window.hasShadow = true
-            window.isMovableByWindowBackground = true
+            // Every mouse drag inside the phone belongs to iOS. Enabling
+            // background dragging here caused macOS to move the whole window
+            // instead of forwarding the gesture to the device.
+            window.isMovableByWindowBackground = false
+            window.contentView?.wantsLayer = true
+            window.contentView?.layer?.cornerRadius = 42
+            window.contentView?.layer?.cornerCurve = .continuous
+            window.contentView?.layer?.masksToBounds = true
             updateAspect(mirrorContentSize, forceResize: true)
+            repositionMirrorAccessory()
         } else {
+            hideMirrorAccessory()
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.titleVisibility = .visible
             window.titlebarAppearsTransparent = false
             window.isOpaque = true
             window.backgroundColor = .windowBackgroundColor
+            window.isMovableByWindowBackground = true
+            window.contentView?.layer?.cornerRadius = 0
+            window.contentView?.layer?.masksToBounds = false
             window.contentAspectRatio = .zero
             window.minSize = NSSize(width: 760, height: 560)
             let current = window.frame
@@ -436,10 +500,141 @@ final class AppWindowManager {
             window.setContentSize(target)
             window.center()
         }
+        repositionMirrorAccessory()
     }
 
     func setAlwaysOnTop(_ enabled: Bool) {
-        window?.level = enabled ? .floating : .normal
+        let level: NSWindow.Level = enabled ? .floating : .normal
+        window?.level = level
+        accessoryPanel?.level = level
+    }
+
+    func showMirrorAccessory(model: AppModel, store: SettingsStore) {
+        guard let window else { return }
+        let root = AnyView(MirrorAccessoryBar(model: model, store: store))
+        if let hosting = accessoryHostingView, let panel = accessoryPanel {
+            hosting.rootView = root
+            if panel.parent !== window {
+                panel.parent?.removeChildWindow(panel)
+                window.addChildWindow(panel, ordered: .above)
+            }
+            repositionMirrorAccessory()
+            return
+        }
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 390, height: 52),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.hidesOnDeactivate = false
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.collectionBehavior = [.fullScreenAuxiliary, .transient]
+        panel.level = window.level
+        panel.ignoresMouseEvents = false
+
+        let hosting = NSHostingView(rootView: root)
+        hosting.frame = NSRect(x: 0, y: 0, width: 390, height: 52)
+        hosting.wantsLayer = true
+        hosting.layer?.backgroundColor = NSColor.clear.cgColor
+        panel.contentView = hosting
+
+        accessoryPanel = panel
+        accessoryHostingView = hosting
+        window.addChildWindow(panel, ordered: .above)
+        repositionMirrorAccessory()
+    }
+
+    func setMirrorAccessoryVisible(_ visible: Bool) {
+        guard mirrorMode, let panel = accessoryPanel else { return }
+        if visible {
+            repositionMirrorAccessory()
+            panel.orderFront(nil)
+        } else {
+            panel.orderOut(nil)
+        }
+    }
+
+    func hideMirrorAccessory() {
+        guard let panel = accessoryPanel else { return }
+        panel.parent?.removeChildWindow(panel)
+        panel.orderOut(nil)
+        accessoryPanel = nil
+        accessoryHostingView = nil
+        mirrorDragStartOrigin = nil
+    }
+
+    func beginMirrorWindowDrag() {
+        mirrorDragStartOrigin = window?.frame.origin
+    }
+
+    func updateMirrorWindowDrag(translation: CGSize) {
+        guard let window, let start = mirrorDragStartOrigin else { return }
+        window.setFrameOrigin(NSPoint(x: start.x + translation.width,
+                                      y: start.y - translation.height))
+        repositionMirrorAccessory()
+    }
+
+    func endMirrorWindowDrag() {
+        mirrorDragStartOrigin = nil
+    }
+
+    private func repositionMirrorAccessory() {
+        guard mirrorMode, let window, let panel = accessoryPanel else { return }
+        let parent = window.frame
+        let size = panel.frame.size
+        let visible = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
+        let gap: CGFloat = 9
+
+        let roomAbove = visible.maxY - parent.maxY
+        let roomRight = visible.maxX - parent.maxX
+        let roomLeft = parent.minX - visible.minX
+        let origin: NSPoint
+        if roomAbove >= size.height + gap {
+            origin = NSPoint(
+                x: min(max(parent.midX - size.width / 2, visible.minX), visible.maxX - size.width),
+                y: parent.maxY + gap
+            )
+        } else if roomRight >= size.width + gap {
+            origin = NSPoint(x: parent.maxX + gap,
+                             y: min(max(parent.maxY - size.height, visible.minY), visible.maxY - size.height))
+        } else if roomLeft >= size.width + gap {
+            origin = NSPoint(x: parent.minX - size.width - gap,
+                             y: min(max(parent.maxY - size.height, visible.minY), visible.maxY - size.height))
+        } else {
+            origin = NSPoint(
+                x: min(max(parent.midX - size.width / 2, visible.minX), visible.maxX - size.width),
+                y: max(visible.minY, parent.minY - size.height - gap)
+            )
+        }
+        panel.setFrameOrigin(origin)
+    }
+
+    private func installWindowObservers(_ window: NSWindow) {
+        let center = NotificationCenter.default
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification,
+                     NSWindow.didChangeScreenNotification] {
+            windowObservers.append(center.addObserver(
+                forName: name,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.repositionMirrorAccessory()
+                }
+            })
+        }
+    }
+
+    private func removeWindowObservers() {
+        let center = NotificationCenter.default
+        windowObservers.forEach(center.removeObserver)
+        windowObservers.removeAll()
     }
 }
 

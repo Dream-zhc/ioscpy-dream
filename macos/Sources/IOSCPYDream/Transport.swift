@@ -304,7 +304,7 @@ final class IOSCPYSession: @unchecked Sendable {
             } catch {
                 if mode == .lan {
                     throw ConnectionFailure.processFailed(
-                        "无法连接 \(host):\(port)。请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.2 手机端。系统错误：\(error.localizedDescription)"
+                        "无法连接 \(host):\(port)。请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.3 手机端。系统错误：\(error.localizedDescription)"
                     )
                 }
                 throw error

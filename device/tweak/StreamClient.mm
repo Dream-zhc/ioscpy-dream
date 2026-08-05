@@ -101,8 +101,10 @@ static uint64_t clipHash(NSString *t) {
         _codec = _config.codec;
         _effectiveMaxDimension = _config.max_dimension;
         _effectiveBitrate = _config.bitrate_bps;
-        _captureQueue = dispatch_queue_create("com.ioscpy.capture", DISPATCH_QUEUE_SERIAL);
-        _sendQueue = dispatch_queue_create("com.ioscpy.send", DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_attr_t realtimeAttr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+        _captureQueue = dispatch_queue_create("com.ioscpy.capture", realtimeAttr);
+        _sendQueue = dispatch_queue_create("com.ioscpy.send", realtimeAttr);
         _clipQueue = dispatch_queue_create("com.ioscpy.clip", DISPATCH_QUEUE_SERIAL);
         _socketWriteLock = [[NSLock alloc] init];
         [self startClipboardObserver];
@@ -392,7 +394,11 @@ static uint64_t clipHash(NSString *t) {
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _captureQueue);
     uint16_t fps = MAX(_config.target_fps, 1);
     uint64_t interval = NSEC_PER_SEC / fps;
-    dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, interval, interval / 4);
+    // At 120 FPS the former interval/4 leeway was large enough to permit visible
+    // timer coalescing. Keep only a small scheduling tolerance while an active
+    // remote-control session explicitly requests high refresh.
+    uint64_t leeway = MIN(interval / 20, 200 * NSEC_PER_USEC);
+    dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, interval, leeway);
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_timer, ^{ [weakSelf captureAndSend]; });
     dispatch_resume(_timer);
@@ -433,7 +439,8 @@ static uint64_t clipHash(NSString *t) {
 
 - (void)emitStatsIfNeeded {
     double now = streamNowMs();
-    if (_fd < 0 || now - _lastStatsMs < 1000.0) {
+    double windowMs = now - _lastStatsMs;
+    if (_fd < 0 || windowMs < 1000.0) {
         return;
     }
     double captureAvg = _capturedFrames ? _captureMsTotal / _capturedFrames : 0;
@@ -483,6 +490,7 @@ static uint64_t clipHash(NSString *t) {
     }
     NSDictionary *stats = @{
         @"uptime_ms": @((uint64_t)MAX(now - _streamStartMs, 0)),
+        @"window_ms": @(windowMs),
         @"requested_fps": @(_config.target_fps),
         @"configured_max_dimension": @(_config.max_dimension),
         @"max_dimension": @(_effectiveMaxDimension),
@@ -606,9 +614,13 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     if (!IOSPYHardwareVideoAvailable(_codec)) {
         return NO;
     }
-    // Bound hardware work. A timer tick that arrives while two frames are still
-    // encoding is stale by definition, so drop it instead of building latency.
-    if (_h264InFlight >= 2) {
+    // Compression latency is not the same as throughput. At 2160p the hardware
+    // callback may arrive ~35-45 ms later while still accepting a new frame every
+    // 8.3 ms. Two in-flight frames therefore capped throughput near 50 FPS.
+    // Keep enough slots to fill the pipeline, but never allow an unbounded queue.
+    NSUInteger maxInFlight = _config.target_fps >= 100 ? 6 :
+                             (_config.target_fps >= 80 ? 5 : 4);
+    if (_h264InFlight >= maxInFlight) {
         _droppedFrames++;
         return YES;
     }
@@ -679,10 +691,10 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                 self->_needKeyframe = NO;
             }
 
-            // Keep the socket queue short. If two encoded frames are already
+            // Keep the socket queue short. If three encoded frames are already
             // waiting, discard this one and force a new keyframe so the decoder
             // can recover without replaying stale inter-frames.
-            if (self->_sendBacklog >= 2) {
+            if (self->_sendBacklog >= 3) {
                 self->_droppedFrames++;
                 self->_needKeyframe = YES;
                 return;

@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "ioscpy"
-version = "0.3.0-dream.2"
+version = "0.3.0-dream.3"
 dependencies = [
  "anyhow",
  "arboard",
