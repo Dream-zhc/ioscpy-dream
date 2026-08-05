@@ -75,7 +75,11 @@ fn paste_now(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
 
 /// Translate a sidebar button press into the same messages its matching
 /// keyboard shortcut sends.
-fn dispatch_sidebar_action(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>, action: sidebar::Action) {
+fn dispatch_sidebar_action(
+    tx: &Sender<InputFrame>,
+    clip: &Arc<Mutex<ClipState>>,
+    action: sidebar::Action,
+) {
     use sidebar::Action::*;
     match action {
         Home => send_action(tx, SystemAction::Home),
@@ -266,9 +270,10 @@ impl minifb::InputCallback for TextForwarder {
         }
         if let Some(c) = char::from_u32(uni_char) {
             if !c.is_control() {
-                let _ = self
-                    .tx
-                    .send(InputFrame::new(MessageType::InputText, protocol::encode_text(&c.to_string())));
+                let _ = self.tx.send(InputFrame::new(
+                    MessageType::InputText,
+                    protocol::encode_text(&c.to_string()),
+                ));
             }
         }
     }
@@ -595,7 +600,12 @@ pub fn run_window(
         let (gw, gh) = window.get_size();
         let content_w = gw.saturating_sub(sidebar::WIDTH).max(1);
 
-        let input_ctx = InputCtx { content_w, win_h: gh, tx: &input_tx, clip: &clip };
+        let input_ctx = InputCtx {
+            content_w,
+            win_h: gh,
+            tx: &input_tx,
+            clip: &clip,
+        };
         pump_input(&window, &current, &mut input, &input_ctx);
         #[cfg(not(target_os = "macos"))]
         pump_keys(&window, &input_tx, &clip);
@@ -609,7 +619,9 @@ pub fn run_window(
         let bs = backing_scale(&window);
         let ow = (content_w as f32 * bs).max(1.0);
         let oh = (gh as f32 * bs).max(1.0);
-        let down = (2600.0 / (ow + sidebar::WIDTH as f32 * bs)).min(2600.0 / oh).min(1.0);
+        let down = (2600.0 / (ow + sidebar::WIDTH as f32 * bs))
+            .min(2600.0 / oh)
+            .min(1.0);
         let content_px = ((ow * down) as usize).max(1);
         let total_h = ((oh * down) as usize).max(1);
         let sb_px = ((sidebar::WIDTH as f32 * bs * down).round() as usize).max(1);
@@ -618,7 +630,14 @@ pub fn run_window(
         combined.clear();
         combined.resize(stride * total_h, 0);
         scale_frame(&current, content_px, total_h, stride, &mut combined);
-        sidebar::draw_into(&mut combined, stride, content_px, sb_px, total_h, input.sidebar_down);
+        sidebar::draw_into(
+            &mut combined,
+            stride,
+            content_px,
+            sb_px,
+            total_h,
+            input.sidebar_down,
+        );
 
         window
             .update_with_buffer(&combined, stride, total_h)
@@ -684,7 +703,14 @@ fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx
     };
 
     if state.touching {
-        let (nx, ny) = map_to_norm(pos.0, pos.1, ctx.content_w, ctx.win_h, frame.width, frame.height);
+        let (nx, ny) = map_to_norm(
+            pos.0,
+            pos.1,
+            ctx.content_w,
+            ctx.win_h,
+            frame.width,
+            frame.height,
+        );
         if (nx - state.last.0).abs() > 0.001 || (ny - state.last.1).abs() > 0.001 {
             // Only emit a move when the position actually changes.
             send_touch(ctx.tx, TouchPhase::Move, nx, ny);
@@ -702,7 +728,12 @@ fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx
 
 /// A press that wasn't already tracked as a touch or a held button: route it
 /// to a touch-down or a sidebar button depending on where it landed.
-fn handle_fresh_press(pos: (f32, f32), frame: &DecodedFrame, state: &mut InputState, ctx: &InputCtx) {
+fn handle_fresh_press(
+    pos: (f32, f32),
+    frame: &DecodedFrame,
+    state: &mut InputState,
+    ctx: &InputCtx,
+) {
     let (mx, my) = pos;
     if (mx as usize) < ctx.content_w {
         let (nx, ny) = map_to_norm(mx, my, ctx.content_w, ctx.win_h, frame.width, frame.height);

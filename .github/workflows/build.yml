@@ -16,6 +16,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  host-checks:
+    name: Rust format, lint, and tests
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust components
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache Cargo build data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            host/target
+          key: ${{ runner.os }}-checks-${{ hashFiles('host/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-checks-
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path host/Cargo.toml --locked --all-targets --all-features
+
+      - name: Run tests
+        run: cargo test --manifest-path host/Cargo.toml --locked --all-targets
+
   macos-host:
     name: macOS host (universal)
     runs-on: macos-14
@@ -74,6 +108,7 @@ jobs:
     timeout-minutes: 30
     env:
       THEOS: ${{ github.workspace }}/.theos
+      THEOS_REVISION: 16362d3aa83a0acd56df4493d575d34306d42478
 
     steps:
       - name: Check out repository
@@ -83,7 +118,11 @@ jobs:
         run: brew install dpkg ldid xz
 
       - name: Install Theos
-        run: git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+        run: |
+          git clone --filter=blob:none https://github.com/theos/theos.git "$THEOS"
+          git -C "$THEOS" checkout --detach "$THEOS_REVISION"
+          git -C "$THEOS" submodule update --init --recursive --depth 1
+          test "$(git -C "$THEOS" rev-parse HEAD)" = "$THEOS_REVISION"
 
       - name: Build rootless package
         run: make device-rootless
