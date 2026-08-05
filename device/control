@@ -1,6 +1,6 @@
 Package: com.ioscpy.device
 Name: ioscpy
-Version: 0.1.5
+Version: 0.2.0~dream.1
 Architecture: iphoneos-arm
 Description: Mirror and control this device from macOS over USB.
 Maintainer: Lautaro Villarreal Culic' <lautaro@lautarovculic.com>
