@@ -1,0 +1,103 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - "ci/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-host:
+    name: macOS host (universal)
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache Cargo build data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            host/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('host/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build macOS host binaries
+        run: |
+          cargo build --manifest-path host/Cargo.toml --release --locked --target aarch64-apple-darwin
+          cargo build --manifest-path host/Cargo.toml --release --locked --target x86_64-apple-darwin
+
+      - name: Create universal macOS binary
+        run: |
+          mkdir -p dist/macos
+          lipo -create \
+            host/target/aarch64-apple-darwin/release/ioscpy \
+            host/target/x86_64-apple-darwin/release/ioscpy \
+            -output dist/macos/ioscpy
+          chmod +x dist/macos/ioscpy
+          codesign --force --sign - dist/macos/ioscpy
+          file dist/macos/ioscpy
+          tar -czf dist/ioscpy-macos-universal.tar.gz -C dist/macos ioscpy
+
+      - name: Upload macOS host artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioscpy-macos-universal
+          path: |
+            dist/macos/ioscpy
+            dist/ioscpy-macos-universal.tar.gz
+          if-no-files-found: error
+
+  device-rootless:
+    name: iOS device package (rootless)
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      THEOS: ${{ github.workspace }}/.theos
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install packaging dependencies
+        run: brew install dpkg ldid xz
+
+      - name: Install Theos
+        run: git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+
+      - name: Build rootless package
+        run: make device-rootless
+
+      - name: Collect device package
+        run: |
+          mkdir -p dist/device
+          find device/packages -maxdepth 1 -type f -name '*.deb' -exec cp {} dist/device/ \;
+          test -n "$(find dist/device -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          shasum -a 256 dist/device/*.deb
+
+      - name: Upload rootless package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioscpy-device-rootless
+          path: dist/device/*.deb
+          if-no-files-found: error
