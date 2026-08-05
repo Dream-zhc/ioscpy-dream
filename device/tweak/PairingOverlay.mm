@@ -97,7 +97,9 @@ void IOSPYShowPairingCode(NSString *code, NSString *hostName, NSTimeInterval tim
         window.hidden = NO;
 
         NSTimeInterval duration = MAX(10, MIN(timeout, 120));
-        dispatch_block_t hide = dispatch_block_create(0, ^{ hidePairingCodeOnMain(); });
+        dispatch_block_t hide = dispatch_block_create((dispatch_block_flags_t)0, ^{
+            hidePairingCodeOnMain();
+        });
         gHideBlock = hide;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(duration * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), hide);
