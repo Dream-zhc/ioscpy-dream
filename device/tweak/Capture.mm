@@ -2,7 +2,6 @@
 #import <UIKit/UIKit.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <ImageIO/ImageIO.h>
-#import <MobileCoreServices/MobileCoreServices.h>
 #import <dlfcn.h>
 
 // The render server can blit the live display straight into an IOSurface. It's
@@ -265,8 +264,13 @@ NSData *IOSPYCaptureScreenJPEG(CGFloat maxDimension, CGFloat quality,
 
         double encodeStart = nowMs();
         NSMutableData *data = [NSMutableData data];
+        // ImageIO expects a UTI string here. kUTTypeJPEG lived in the legacy
+        // MobileCoreServices headers and is no longer exposed by current Apple
+        // SDKs used by GitHub's macOS runners. "public.jpeg" is the canonical
+        // JPEG UTI and keeps the tweak buildable across old and new SDKs.
+        CFStringRef jpegType = CFSTR("public.jpeg");
         CGImageDestinationRef dest =
-            CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, kUTTypeJPEG, 1, NULL);
+            CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, jpegType, 1, NULL);
         BOOL ok = NO;
         if (dest) {
             NSDictionary *options = @{(__bridge id)kCGImageDestinationLossyCompressionQuality: @(quality)};
