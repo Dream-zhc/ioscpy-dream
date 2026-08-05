@@ -3,6 +3,55 @@ import CoreImage
 import CoreVideo
 import MetalKit
 
+final class VideoFrameMailbox: @unchecked Sendable {
+    struct Snapshot {
+        let buffer: CVPixelBuffer
+        let width: Int
+        let height: Int
+        let orientation: Int
+        let generation: UInt64
+    }
+
+    private let lock = NSLock()
+    private var buffer: CVPixelBuffer?
+    private var width = 393
+    private var height = 852
+    private var orientation = 1
+    private var generation: UInt64 = 0
+
+    @discardableResult
+    func publish(_ buffer: CVPixelBuffer, width: Int, height: Int, orientation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let geometryChanged = self.width != width || self.height != height || self.orientation != orientation
+        self.buffer = buffer
+        self.width = max(width, 1)
+        self.height = max(height, 1)
+        self.orientation = orientation
+        generation &+= 1
+        return geometryChanged
+    }
+
+    func snapshot(after previousGeneration: UInt64) -> Snapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation != previousGeneration, let buffer else { return nil }
+        return Snapshot(
+            buffer: buffer,
+            width: width,
+            height: height,
+            orientation: orientation,
+            generation: generation
+        )
+    }
+
+    func geometry() -> (width: Int, height: Int, orientation: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (width, height, orientation)
+    }
+}
+
 @MainActor
 final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInputClient {
     var onTouch: ((UInt8, Float, Float) -> Void)?
@@ -12,21 +61,21 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
     var onFramePresented: (() -> Void)?
     var onPointerActivity: (() -> Void)?
 
-    private let frameLock = NSLock()
-    private var latestPixelBuffer: CVPixelBuffer?
-    private var latestOrientation = 1
+    private let mailbox: VideoFrameMailbox
+    private var renderedGeneration: UInt64 = 0
     private var ciContext: CIContext!
     private var commandQueue: MTLCommandQueue!
     private var colorSpace = CGColorSpaceCreateDeviceRGB()
     private var marked = NSMutableAttributedString()
     private var selection = NSRange(location: 0, length: 0)
 
-    override init(frame frameRect: NSRect, device: MTLDevice?) {
+    init(frame frameRect: NSRect, device: MTLDevice?, mailbox: VideoFrameMailbox) {
+        self.mailbox = mailbox
         let selectedDevice = device ?? MTLCreateSystemDefaultDevice()
         super.init(frame: frameRect, device: selectedDevice)
         framebufferOnly = false
         enableSetNeedsDisplay = false
-        isPaused = true
+        isPaused = false
         autoResizeDrawable = true
         preferredFramesPerSecond = 120
         layer?.isOpaque = true
@@ -55,20 +104,12 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    func update(pixelBuffer: CVPixelBuffer, orientation: Int) {
-        frameLock.lock()
-        latestPixelBuffer = pixelBuffer
-        latestOrientation = orientation
-        frameLock.unlock()
-        DispatchQueue.main.async { [weak self] in self?.draw() }
-    }
-
     func draw(in view: MTKView) {
-        frameLock.lock()
-        let buffer = latestPixelBuffer
-        let orientation = latestOrientation
-        frameLock.unlock()
-        guard let buffer,
+        guard let snapshot = mailbox.snapshot(after: renderedGeneration) else { return }
+        renderedGeneration = snapshot.generation
+        let buffer = snapshot.buffer
+        let orientation = snapshot.orientation
+        guard
               let drawable = currentDrawable,
               let commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
@@ -106,30 +147,26 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
-    override func mouseEntered(with event: NSEvent) { onPointerActivity?() }
-    override func mouseMoved(with event: NSEvent) { onPointerActivity?() }
+    override func mouseEntered(with event: NSEvent) { reportPointerActivity(event) }
+    override func mouseMoved(with event: NSEvent) { reportPointerActivity(event) }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        onPointerActivity?()
         let point = normalizedPoint(event)
         onTouch?(0, point.x, point.y)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        onPointerActivity?()
         let point = normalizedPoint(event)
         onTouch?(1, point.x, point.y)
     }
 
     override func mouseUp(with event: NSEvent) {
-        onPointerActivity?()
         let point = normalizedPoint(event)
         onTouch?(2, point.x, point.y)
     }
 
     override func scrollWheel(with event: NSEvent) {
-        onPointerActivity?()
         let point = normalizedPoint(event)
         let payload = makeScrollPayload(
             phase: Self.phaseCode(event.phase),
@@ -145,7 +182,6 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
     }
 
     override func keyDown(with event: NSEvent) {
-        onPointerActivity?()
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.command), let chars = event.charactersIgnoringModifiers?.lowercased() {
             let mapping: [String: UInt8] = ["a": 10, "c": 11, "v": 12, "x": 13, "z": 14]
@@ -181,16 +217,43 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
 
     private func normalizedPoint(_ event: NSEvent) -> (x: Float, y: Float) {
         let point = convert(event.locationInWindow, from: nil)
-        let u = Float(min(max(point.x / max(bounds.width, 1), 0), 1))
-        let v = Float(min(max(1 - point.y / max(bounds.height, 1), 0), 1))
-        frameLock.lock()
-        let orientation = latestOrientation
-        frameLock.unlock()
-        switch orientation {
-        case 2: return (1 - u, 1 - v)
-        case 3: return (v, 1 - u)
-        case 4: return (1 - v, u)
-        default: return (u, v)
+        let geometry = mailbox.geometry()
+        let width = geometry.width
+        let height = geometry.height
+        let orientation = geometry.orientation
+        let uprightWidth = (orientation == 3 || orientation == 4) ? height : width
+        let uprightHeight = (orientation == 3 || orientation == 4) ? width : height
+        let sourceAspect = CGFloat(uprightWidth) / CGFloat(max(uprightHeight, 1))
+        let viewAspect = bounds.width / max(bounds.height, 1)
+        let contentRect: CGRect
+        if viewAspect > sourceAspect {
+            let contentWidth = bounds.height * sourceAspect
+            contentRect = CGRect(
+                x: (bounds.width - contentWidth) * 0.5,
+                y: 0,
+                width: contentWidth,
+                height: bounds.height
+            )
+        } else {
+            let contentHeight = bounds.width / sourceAspect
+            contentRect = CGRect(
+                x: 0,
+                y: (bounds.height - contentHeight) * 0.5,
+                width: bounds.width,
+                height: contentHeight
+            )
+        }
+        let u = Float(min(max((point.x - contentRect.minX) / max(contentRect.width, 1), 0), 1))
+        let v = Float(min(max(1 - (point.y - contentRect.minY) / max(contentRect.height, 1), 0), 1))
+        return (u, v)
+    }
+
+    private func reportPointerActivity(_ event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let nearTop = point.y >= bounds.maxY - 72
+        let nearRight = point.x >= bounds.maxX - 72
+        if nearTop || nearRight {
+            onPointerActivity?()
         }
     }
 

@@ -14,7 +14,7 @@
 #import <unistd.h>
 #import <errno.h>
 
-NSString *const IOSPYDaemonVersion = @"0.3.0-dream.1";
+NSString *const IOSPYDaemonVersion = @"0.3.0-dream.2";
 static NSString *const IOSPYTrustPath = @"/var/mobile/Library/Preferences/com.ioscpy.trust.plist";
 static const NSTimeInterval IOSPYTrustLifetime = 30.0 * 24.0 * 60.0 * 60.0;
 static const NSTimeInterval IOSPYPairingLifetime = 120.0;
@@ -431,6 +431,12 @@ static const NSTimeInterval IOSPYPairingLifetime = 120.0;
         [self sendPairingError:fd code:@"PAIR_CODE_INVALID"
                        message:@"The four-digit pairing code is incorrect"
                      pairingID:challenge[@"pairing_id"] ?: @""];
+        return NO;
+    }
+
+    if (![[IOSPYFrameIngest shared] tweakConnected]) {
+        [self sendError:fd code:@"SPRINGBOARD_BRIDGE_UNAVAILABLE" fatal:YES
+                message:@"SpringBoard bridge is not connected; run sbreload and try again"];
         return NO;
     }
 

@@ -44,7 +44,7 @@ static NSDictionary *fetchHandshake(uint16_t port) {
     }
     NSDictionary *hello = @{
         @"role": @"ctl",
-        @"host_version": @"0.3.0-dream.1",
+        @"host_version": @"0.3.0-dream.2",
         @"protocol_version": @(IOSPY_PROTOCOL_VERSION),
         @"nonce": @"00",
     };
@@ -66,7 +66,7 @@ static int sendPrivilegedMessage(IOSPYMessageType type, NSData *commandPayload) 
     if (fd < 0) return 1;
     NSDictionary *hello = @{
         @"role": @"ctl",
-        @"host_version": @"0.3.0-dream.1",
+        @"host_version": @"0.3.0-dream.2",
         @"protocol_version": @(IOSPY_PROTOCOL_VERSION),
         @"nonce": @"00",
     };

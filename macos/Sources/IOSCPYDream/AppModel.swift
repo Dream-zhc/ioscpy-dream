@@ -23,15 +23,14 @@ final class AppModel: ObservableObject {
     private var session: IOSCPYSession?
     private let decoder = VideoDecoder()
     private let audioPlayer = AudioPlayer()
+    private let performanceCounters = PerformanceCounters()
+    let frameMailbox = VideoFrameMailbox()
     private weak var mirrorView: MirrorMetalView?
-    private var latestFrame: (CVPixelBuffer, Int)?
     private var pendingPairing: (DeviceProfile, ConnectionMode)?
     private var reconnectTask: Task<Void, Never>?
+    private var statsTask: Task<Void, Never>?
     private var userDisconnected = false
-    private var receivedFrames = 0
-    private var presentedFrames = 0
-    private var receivedBytes = 0
-    private var lastStatsAt = ContinuousClock.now
+    private var didLaunch = false
     private var toolbarHideTask: Task<Void, Never>?
     private let hostID: String
 
@@ -45,9 +44,18 @@ final class AppModel: ObservableObject {
             hostID = created
         }
 
+        let mailbox = frameMailbox
         decoder.onPixelBuffer = { [weak self] envelope, width, height, orientation in
-            Task { @MainActor [weak self] in
-                self?.handleDecodedFrame(envelope.buffer, width: width, height: height, orientation: orientation)
+            let geometryChanged = mailbox.publish(
+                envelope.buffer,
+                width: width,
+                height: height,
+                orientation: orientation
+            )
+            if geometryChanged {
+                Task { @MainActor [weak self] in
+                    self?.handleFrameGeometry(width: width, height: height, orientation: orientation)
+                }
             }
         }
         decoder.onDecodeError = { error in
@@ -63,6 +71,8 @@ final class AppModel: ObservableObject {
     }
 
     func launch() {
+        guard !didLaunch else { return }
+        didLaunch = true
         Task {
             await refreshDevices()
             guard store.state.preferences.autoConnectLastDevice,
@@ -148,6 +158,7 @@ final class AppModel: ObservableObject {
         blackScreenEnabled = false
 
         try await connected.start(settings: updated.video, audio: updated.audioEnabled)
+        startStatsTask()
         screen = .mirror
         status = .connected("\(mode.title) · \(connected.capabilities.deviceModel) · iOS \(connected.capabilities.iosVersion)")
         stats.transport = mode.title
@@ -164,14 +175,11 @@ final class AppModel: ObservableObject {
     }
 
     private func configureCallbacks(_ connected: IOSCPYSession) {
-        connected.onVideo = { [weak self] packet in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.receivedFrames += 1
-                self.receivedBytes += packet.bytes.count
-                self.decoder.decode(packet)
-                self.updateStatsClock()
-            }
+        let decoder = self.decoder
+        let counters = performanceCounters
+        connected.onVideo = { packet in
+            counters.recordReceived(bytes: packet.bytes.count)
+            decoder.decode(packet)
         }
         connected.onStats = { data in
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
@@ -186,9 +194,10 @@ final class AppModel: ObservableObject {
         connected.onRTT = { [weak self] value in
             Task { @MainActor [weak self] in self?.stats.latencyMs = value }
         }
-        connected.onDisconnected = { [weak self] error in
+        connected.onDisconnected = { [weak self, weak connected] error in
             Task { @MainActor [weak self] in
-                self?.handleDisconnect(error)
+                guard let self, let connected, self.session === connected else { return }
+                self.handleDisconnect(error)
             }
         }
     }
@@ -218,6 +227,8 @@ final class AppModel: ObservableObject {
         userDisconnected = true
         reconnectTask?.cancel()
         reconnectTask = nil
+        statsTask?.cancel()
+        statsTask = nil
         session?.stop(userInitiated: true)
         session = nil
         decoder.invalidate()
@@ -230,6 +241,8 @@ final class AppModel: ObservableObject {
 
     private func handleDisconnect(_ error: Error?) {
         session = nil
+        statsTask?.cancel()
+        statsTask = nil
         decoder.invalidate()
         audioPlayer.stop()
         guard !userDisconnected, let device = currentDevice else {
@@ -272,19 +285,12 @@ final class AppModel: ObservableObject {
         view.onText = { [weak self] text in self?.session?.sendText(text) }
         view.onKey = { [weak self] code in self?.session?.sendKey(code) }
         view.onPointerActivity = { [weak self] in Task { @MainActor in self?.revealToolbar() } }
-        view.onFramePresented = { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.presentedFrames += 1
-                self?.updateStatsClock()
-            }
-        }
-        if let latestFrame { view.update(pixelBuffer: latestFrame.0, orientation: latestFrame.1) }
+        let counters = performanceCounters
+        view.onFramePresented = { counters.recordPresented() }
         DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
     }
 
-    private func handleDecodedFrame(_ buffer: CVPixelBuffer, width: Int, height: Int, orientation: Int) {
-        latestFrame = (buffer, orientation)
-        mirrorView?.update(pixelBuffer: buffer, orientation: orientation)
+    private func handleFrameGeometry(width: Int, height: Int, orientation: Int) {
         let upright = (orientation == 3 || orientation == 4)
             ? CGSize(width: height, height: width)
             : CGSize(width: width, height: height)
@@ -294,17 +300,19 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func updateStatsClock() {
-        let elapsed = lastStatsAt.duration(to: .now)
-        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-        guard seconds >= 1 else { return }
-        stats.receiveFPS = Double(receivedFrames) / seconds
-        stats.presentFPS = Double(presentedFrames) / seconds
-        stats.bitrateMbps = Double(receivedBytes * 8) / seconds / 1_000_000
-        receivedFrames = 0
-        presentedFrames = 0
-        receivedBytes = 0
-        lastStatsAt = .now
+    private func startStatsTask() {
+        statsTask?.cancel()
+        performanceCounters.reset()
+        statsTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                let sample = self.performanceCounters.consume()
+                self.stats.receiveFPS = sample.receiveFPS
+                self.stats.presentFPS = sample.presentFPS
+                self.stats.bitrateMbps = sample.bitrateMbps
+            }
+        }
     }
 
     func revealToolbar() {
@@ -363,6 +371,7 @@ final class AppWindowManager {
     static let shared = AppWindowManager()
     weak var window: NSWindow?
     private var mirrorMode = false
+    private var mirrorContentSize = CGSize(width: 393, height: 852)
 
     func attach(_ window: NSWindow) {
         self.window = window
@@ -382,6 +391,7 @@ final class AppWindowManager {
             window.backgroundColor = .clear
             window.hasShadow = true
             window.isMovableByWindowBackground = true
+            updateAspect(mirrorContentSize, forceResize: true)
         } else {
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.titleVisibility = .visible
@@ -398,15 +408,31 @@ final class AppWindowManager {
         }
     }
 
-    func updateAspect(_ size: CGSize) {
+    func updateAspect(_ size: CGSize, forceResize: Bool = false) {
         guard mirrorMode, let window, size.width > 0, size.height > 0 else { return }
+        let previousAspect = mirrorContentSize.width / max(mirrorContentSize.height, 1)
+        let nextAspect = size.width / size.height
+        let orientationChanged = (previousAspect < 1) != (nextAspect < 1)
+        mirrorContentSize = size
         window.contentAspectRatio = size
         let screen = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
-        let maxHeight = max(480, screen.height * 0.86)
-        let maxWidth = max(320, screen.width * 0.78)
-        let scale = min(maxHeight / size.height, maxWidth / size.width, 1)
-        let target = NSSize(width: max(320, size.width * scale), height: max(480, size.height * scale))
-        if window.frame.width > maxWidth || window.frame.height > maxHeight || window.frame.width < 260 {
+        let maxHeight = max(520, screen.height * 0.88)
+        let maxWidth = max(560, screen.width * 0.82)
+        let aspect = size.width / size.height
+        let target: NSSize
+        if aspect < 1 {
+            let height = maxHeight
+            target = NSSize(width: height * aspect, height: height)
+            window.minSize = NSSize(width: 280, height: 280 / aspect)
+        } else {
+            let width = maxWidth
+            target = NSSize(width: width, height: width / aspect)
+            window.minSize = NSSize(width: 560, height: 560 / aspect)
+        }
+        let current = window.contentLayoutRect.size
+        let currentAspect = current.width / max(current.height, 1)
+        let ratioWrong = abs(currentAspect - aspect) > 0.01
+        if forceResize || orientationChanged || ratioWrong {
             window.setContentSize(target)
             window.center()
         }
@@ -414,5 +440,55 @@ final class AppWindowManager {
 
     func setAlwaysOnTop(_ enabled: Bool) {
         window?.level = enabled ? .floating : .normal
+    }
+}
+
+private final class PerformanceCounters: @unchecked Sendable {
+    private let lock = NSLock()
+    private var receivedFrames = 0
+    private var presentedFrames = 0
+    private var receivedBytes = 0
+    private var startedAt = ContinuousClock.now
+
+    func recordReceived(bytes: Int) {
+        lock.lock()
+        receivedFrames += 1
+        receivedBytes += bytes
+        lock.unlock()
+    }
+
+    func recordPresented() {
+        lock.lock()
+        presentedFrames += 1
+        lock.unlock()
+    }
+
+    func reset() {
+        lock.lock()
+        receivedFrames = 0
+        presentedFrames = 0
+        receivedBytes = 0
+        startedAt = .now
+        lock.unlock()
+    }
+
+    func consume() -> (receiveFPS: Double, presentFPS: Double, bitrateMbps: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        let elapsed = startedAt.duration(to: .now)
+        let seconds = max(
+            0.001,
+            Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        )
+        let sample = (
+            receiveFPS: Double(receivedFrames) / seconds,
+            presentFPS: Double(presentedFrames) / seconds,
+            bitrateMbps: Double(receivedBytes * 8) / seconds / 1_000_000
+        )
+        receivedFrames = 0
+        presentedFrames = 0
+        receivedBytes = 0
+        startedAt = .now
+        return sample
     }
 }

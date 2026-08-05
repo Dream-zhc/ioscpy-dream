@@ -94,12 +94,14 @@ BOOL IOSPYHardwareVideoAvailable(uint8_t codec) {
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_ProfileLevel,
                          codec == 2 ? kVTProfileLevel_HEVC_Main_AutoLevel
                                     : kVTProfileLevel_H264_High_AutoLevel);
-    // Quality-first VBR. The bitrate remains a peak/average budget, while this
-    // property keeps text edges and gradients from being sacrificed merely to
-    // minimize encode time.
-    [self setProp:kVTCompressionPropertyKey_Quality real:0.92];
-    CFStringRef speedKey = CFSTR("PrioritizeEncodingSpeedOverQuality");
-    VTSessionSetProperty(_session, speedKey, kCFBooleanFalse);
+    // Keep the proven 0.2.0-dream.3 real-time path for high-refresh USB. The
+    // first native-App build forced VideoToolbox to prioritize quality over
+    // encoding speed; at 120 FPS that cut actual throughput roughly in half and
+    // accumulated visible control latency. Bitrate/Profile already preserve
+    // screen quality, so do not override the hardware's real-time scheduler.
+    if (codec == 2 && fps < 90) {
+        [self setProp:kVTCompressionPropertyKey_Quality real:0.90];
+    }
 
     // Refresh a keyframe at least every few seconds (and bound by frame count) so
     // a host that joins mid-stream recovers quickly.

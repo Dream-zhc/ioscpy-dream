@@ -81,7 +81,7 @@ USB mode currently expects `idevice_id` and `iproxy` from libimobiledevice.
 ## Device validation order
 
 1. Install the rootless package and run `sbreload`.
-2. Confirm `ioscpyctl status` reports protocol 5 and version 0.3.0-dream.1.
+2. Confirm `ioscpyctl status` reports protocol 5 and version 0.3.0-dream.2.
 3. Open the Mac app and validate USB video/input before enabling LAN.
 4. Test Chinese text and precise trackpad scrolling.
 5. Test HEVC 120 FPS and record device/host telemetry.

@@ -19,13 +19,24 @@ enum VideoCodec: UInt8, Codable, CaseIterable, Identifiable {
 }
 
 struct VideoSettings: Codable, Equatable {
-    var codec: VideoCodec = .hevc
+    var codec: VideoCodec = .h264
     var targetFPS: Int = 120
-    var maxDimension: Int = 4096
-    var bitrateMbps: Int = 45
+    var maxDimension: Int = 2160
+    var bitrateMbps: Int = 40
     var keyframeSeconds: Int = 1
 
+    /// USB-first preset based on the proven 0.2.0-dream.3 pipeline. H.264 at
+    /// 2160 long-edge and 40 Mbps keeps the device encoder inside its 120 FPS
+    /// real-time path while remaining visually lossless for UI/text content.
     static let extreme = VideoSettings()
+
+    static let nativeHEVC = VideoSettings(
+        codec: .hevc,
+        targetFPS: 120,
+        maxDimension: 4096,
+        bitrateMbps: 45,
+        keyframeSeconds: 1
+    )
 
     mutating func normalize() {
         targetFPS = min(max(targetFPS, 1), 240)
@@ -100,7 +111,7 @@ struct AppPreferences: Codable, Equatable {
 }
 
 struct PersistedState: Codable {
-    var version: Int = 1
+    var version: Int = 2
     var preferences = AppPreferences()
     var devices: [DeviceProfile] = []
 }
@@ -151,7 +162,12 @@ final class SettingsStore: ObservableObject {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         directoryURL = base.appendingPathComponent("ioscpy", isDirectory: true)
         fileURL = directoryURL.appendingPathComponent("settings-v1.json")
-        state = Self.load(from: fileURL)
+        let loaded = Self.load(from: fileURL)
+        let migrated = Self.migrate(loaded)
+        state = migrated
+        if migrated.version != loaded.version || migrated.devices != loaded.devices {
+            save()
+        }
     }
 
     private static func load(from url: URL) -> PersistedState {
@@ -160,6 +176,20 @@ final class SettingsStore: ObservableObject {
             return PersistedState()
         }
         return decoded
+    }
+
+    private static func migrate(_ input: PersistedState) -> PersistedState {
+        guard input.version < 2 else { return input }
+        var output = input
+        output.version = 2
+        for index in output.devices.indices {
+            // The first native-App build inherited 60 FPS and experimental HEVC
+            // values from older profiles. Reset once to the verified high-speed
+            // USB preset; subsequent user changes are preserved normally.
+            output.devices[index].video = .extreme
+            output.devices[index].deviceFrame = true
+        }
+        return output
     }
 
     func save() {

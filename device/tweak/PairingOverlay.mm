@@ -6,7 +6,23 @@
 #import <QuartzCore/QuartzCore.h>
 
 static UIWindow *gPairingWindow = nil;
+static __weak UIWindow *gPreviousKeyWindow = nil;
 static dispatch_block_t gHideBlock = nil;
+
+static UIWindowScene *activeWindowScene(void) {
+    NSSet<UIScene *> *scenes = UIApplication.sharedApplication.connectedScenes;
+    UIWindowScene *fallback = nil;
+    for (UIScene *scene in scenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        if (!fallback) fallback = windowScene;
+        if (scene.activationState == UISceneActivationStateForegroundActive ||
+            scene.activationState == UISceneActivationStateForegroundInactive) {
+            return windowScene;
+        }
+    }
+    return fallback;
+}
 
 static void hidePairingCodeOnMain(void) {
     if (gHideBlock) {
@@ -16,6 +32,10 @@ static void hidePairingCodeOnMain(void) {
     gPairingWindow.hidden = YES;
     gPairingWindow.rootViewController = nil;
     gPairingWindow = nil;
+    if (gPreviousKeyWindow && !gPreviousKeyWindow.hidden) {
+        [gPreviousKeyWindow makeKeyWindow];
+    }
+    gPreviousKeyWindow = nil;
 }
 
 static UILabel *makeLabel(CGFloat size, UIFontWeight weight, UIColor *color) {
@@ -43,8 +63,12 @@ void IOSPYShowPairingCode(NSString *code, NSString *hostName, NSTimeInterval tim
         IOSPYSystemAction(3); // wake; never unlock or bypass the passcode
         hidePairingCodeOnMain();
 
-        CGRect bounds = UIScreen.mainScreen.bounds;
-        UIWindow *window = [[UIWindow alloc] initWithFrame:bounds];
+        UIWindowScene *scene = activeWindowScene();
+        CGRect bounds = scene ? scene.coordinateSpace.bounds : UIScreen.mainScreen.bounds;
+        UIWindow *window = scene
+            ? [[UIWindow alloc] initWithWindowScene:scene]
+            : [[UIWindow alloc] initWithFrame:bounds];
+        window.frame = bounds;
         window.windowLevel = UIWindowLevelAlert + 2500;
         window.backgroundColor = UIColor.clearColor;
         window.userInteractionEnabled = NO;
@@ -94,7 +118,18 @@ void IOSPYShowPairingCode(NSString *code, NSString *hostName, NSTimeInterval tim
         ]];
 
         gPairingWindow = window;
+        for (UIWindow *candidate in scene.windows) {
+            if (candidate.isKeyWindow) {
+                gPreviousKeyWindow = candidate;
+                break;
+            }
+        }
         window.hidden = NO;
+        // A UIWindow created without an attached UIWindowScene can remain
+        // invisible on iOS 16 even though `hidden` is false. The explicit scene
+        // attachment above is the critical part; ordering front is a fallback
+        // for older SpringBoard scene arrangements.
+        [window makeKeyAndVisible];
 
         NSTimeInterval duration = MAX(10, MIN(timeout, 120));
         dispatch_block_t hide = dispatch_block_create((dispatch_block_flags_t)0, ^{

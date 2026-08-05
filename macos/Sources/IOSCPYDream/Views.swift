@@ -285,25 +285,18 @@ struct MirrorView: View {
         ZStack(alignment: .topTrailing) {
             Color.black
             MirrorRepresentable(model: model)
-                .clipShape(RoundedRectangle(cornerRadius: device?.deviceFrame == true ? 46 : 24, style: .continuous))
-                .padding(device?.deviceFrame == true ? 7 : 0)
-                .background {
+                .clipShape(RoundedRectangle(cornerRadius: device?.deviceFrame == true ? 36 : 28, style: .continuous))
+                .overlay {
                     if device?.deviceFrame == true {
-                        RoundedRectangle(cornerRadius: 53, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [Color(white: 0.08), Color(white: 0.015), Color(white: 0.11)],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
+                        RoundedRectangle(cornerRadius: 36, style: .continuous)
+                            .strokeBorder(Color.black.opacity(0.92), lineWidth: 7)
                             .overlay {
-                                RoundedRectangle(cornerRadius: 53, style: .continuous)
-                                    .strokeBorder(.white.opacity(0.2), lineWidth: 0.7)
+                                RoundedRectangle(cornerRadius: 36, style: .continuous)
+                                    .strokeBorder(.white.opacity(0.16), lineWidth: 0.7)
                             }
                     }
                 }
-                .shadow(color: .black.opacity(0.55), radius: 24, y: 12)
+                .shadow(color: .black.opacity(0.48), radius: 18, y: 8)
 
             if model.toolbarVisible {
                 MirrorToolbar(model: model, store: store)
@@ -318,11 +311,6 @@ struct MirrorView: View {
             }
         }
         .contentShape(Rectangle())
-        .onContinuousHover { phase in
-            if case .active(let point) = phase, point.y < 90 || point.x > 0 {
-                model.revealToolbar()
-            }
-        }
         .animation(.easeOut(duration: 0.18), value: model.toolbarVisible)
         .ignoresSafeArea()
     }
@@ -402,9 +390,32 @@ struct SettingsSheet: View {
                         TextField("端口", value: binding(\.lanPort), format: .number)
                         SecureField("锁屏密码（本地明文保存）", text: binding(\.lockPassword))
                         Toggle("此设备自动连接", isOn: binding(\.autoConnect))
+                        LabeledContent("连接状态", value: model.status.message)
+                        Button {
+                            let profile = device
+                            dismiss()
+                            Task { await model.connect(device: profile, mode: .lan) }
+                        } label: {
+                            Label(
+                                device.pairingValid ? "通过局域网连接" : "连接并显示 4 位配对码",
+                                systemImage: "wifi"
+                            )
+                        }
+                        .disabled(device.lanHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        Text("填写 IP 不会自动发起连接。点击上方按钮后，iPhone 才会亮屏并显示配对码；失败原因会显示在主页底部。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
 
                     Section("极致画质") {
+                        HStack {
+                            Button("USB 120 FPS 高性能") {
+                                model.updateCurrentDevice({ $0.video = .extreme }, applyVideo: true)
+                            }
+                            Button("原生 HEVC 120 FPS（实验）") {
+                                model.updateCurrentDevice({ $0.video = .nativeHEVC }, applyVideo: true)
+                            }
+                        }
                         Picker("编码", selection: videoBinding(\.codec)) {
                             ForEach(VideoCodec.allCases) { codec in Text(codec.title).tag(codec) }
                         }
@@ -421,7 +432,7 @@ struct SettingsSheet: View {
                         Picker("VBR 上限", selection: videoBinding(\.bitrateMbps)) {
                             ForEach([25, 35, 45, 60], id: \.self) { Text("\($0) Mbps").tag($0) }
                         }
-                        Text("默认锁定原生分辨率、120 FPS、HEVC、质量优先 VBR；不会自动降低配置。")
+                        Text("USB 默认使用经过验证的 H.264、2160 长边、120 FPS、40 Mbps；原生 HEVC 可手动切换。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -546,7 +557,11 @@ struct MirrorRepresentable: NSViewRepresentable {
     let model: AppModel
 
     func makeNSView(context: Context) -> MirrorMetalView {
-        let view = MirrorMetalView(frame: .zero, device: MTLCreateSystemDefaultDevice())
+        let view = MirrorMetalView(
+            frame: .zero,
+            device: MTLCreateSystemDefaultDevice(),
+            mailbox: model.frameMailbox
+        )
         model.attachMirrorView(view)
         return view
     }

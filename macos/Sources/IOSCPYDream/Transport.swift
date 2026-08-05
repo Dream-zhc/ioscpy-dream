@@ -53,6 +53,12 @@ final class TCPTransport: @unchecked Sendable {
         }
     }
 
+    func enqueue(_ data: Data, completion: (@Sendable (Error?) -> Void)? = nil) {
+        connection.send(content: data, completion: .contentProcessed { error in
+            completion?(error)
+        })
+    }
+
     func receiveExactly(_ count: Int) async throws -> Data {
         guard count >= 0 else { throw ConnectionFailure.protocolError("负数读取长度") }
         if count == 0 { return Data() }
@@ -225,6 +231,10 @@ final class IOSCPYSession: @unchecked Sendable {
     private let transport: TCPTransport
     private let usbForward: USBForward?
     private let sendLock = NSLock()
+    private let realtimeSendQueue = DispatchQueue(
+        label: "com.ioscpy.realtime-control",
+        qos: .userInteractive
+    )
     private var readTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var stopped = false
@@ -289,7 +299,16 @@ final class IOSCPYSession: @unchecked Sendable {
 
         let transport = try TCPTransport(host: host, port: port)
         do {
-            try await transport.start()
+            do {
+                try await transport.start()
+            } catch {
+                if mode == .lan {
+                    throw ConnectionFailure.processFailed(
+                        "无法连接 \(host):\(port)。请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.2 手机端。系统错误：\(error.localizedDescription)"
+                    )
+                }
+                throw error
+            }
             let hello = HelloPayload(
                 nonce: randomHex(byteCount: 16),
                 hostID: hostID,
@@ -424,39 +443,52 @@ final class IOSCPYSession: @unchecked Sendable {
         return current
     }
 
+    private func enqueue(type: MessageType, payload: Data = Data(), streamID: UInt64 = Wire.channelControl) {
+        let current = nextSequence()
+        let frame = makeWireFrame(type: type, streamID: streamID, sequence: current, payload: payload)
+        realtimeSendQueue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.transport.enqueue(frame) { error in
+                if let error {
+                    NSLog("[ioscpy] realtime send failed: %@", error.localizedDescription)
+                }
+            }
+        }
+    }
+
     func updateVideo(_ settings: VideoSettings) async throws {
         try await send(type: .startStream, payload: makeStreamConfig(settings))
     }
 
     func sendTouch(phase: UInt8, x: Float, y: Float) {
-        Task { try? await send(type: .inputTouch, payload: makeTouchPayload(phase: phase, x: x, y: y)) }
+        enqueue(type: .inputTouch, payload: makeTouchPayload(phase: phase, x: x, y: y))
     }
 
     func sendText(_ text: String) {
         guard !text.isEmpty else { return }
-        Task { try? await send(type: .inputText, payload: Data(text.utf8)) }
+        enqueue(type: .inputText, payload: Data(text.utf8))
     }
 
     func sendKey(_ code: UInt8) {
-        Task { try? await send(type: .inputKey, payload: Data([code])) }
+        enqueue(type: .inputKey, payload: Data([code]))
     }
 
     func sendScroll(_ payload: Data) {
-        Task { try? await send(type: .inputScroll, payload: payload) }
+        enqueue(type: .inputScroll, payload: payload)
     }
 
     func systemAction(_ code: UInt16) {
         var value = code.bigEndian
         let payload = Swift.withUnsafeBytes(of: &value) { Data($0) }
-        Task { try? await send(type: .systemAction, payload: payload) }
+        enqueue(type: .systemAction, payload: payload)
     }
 
     func setBlackScreen(_ enabled: Bool) {
-        Task { try? await send(type: .displayMode, payload: Data([enabled ? 1 : 0])) }
+        enqueue(type: .displayMode, payload: Data([enabled ? 1 : 0]))
     }
 
     func setAudio(_ enabled: Bool) {
-        Task { try? await send(type: .audioMode, payload: Data([enabled ? 1 : 0])) }
+        enqueue(type: .audioMode, payload: Data([enabled ? 1 : 0]))
     }
 
     func stop(userInitiated: Bool = true) {
