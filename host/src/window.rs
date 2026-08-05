@@ -5,15 +5,16 @@
 //! replaying stale ones. It also grabs mouse/keyboard input and forwards it as
 //! device-space messages.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use minifb::{MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
+use minifb::{Menu, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 
 use crate::clipboard;
+use crate::config::VideoSettings;
 use crate::input::{map_to_norm, InputFrame};
 use crate::protocol::{self, KeyCode, MessageType, SystemAction, TouchPhase};
 use crate::sidebar;
@@ -73,25 +74,232 @@ fn paste_now(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
     }
 }
 
-/// Translate a sidebar button press into the same messages its matching
-/// keyboard shortcut sends.
+/// Translate a hover-toolbar button press into a device action.
 fn dispatch_sidebar_action(
     tx: &Sender<InputFrame>,
-    clip: &Arc<Mutex<ClipState>>,
+    _clip: &Arc<Mutex<ClipState>>,
     action: sidebar::Action,
 ) {
     use sidebar::Action::*;
     match action {
         Home => send_action(tx, SystemAction::Home),
-        Lock => send_action(tx, SystemAction::Lock),
         AppSwitcher => send_action(tx, SystemAction::AppSwitcher),
-        Rotate => send_action(tx, SystemAction::RotateLeft),
-        Back => send_action(tx, SystemAction::Back),
-        SelectAll => send_key(tx, KeyCode::SelectAll),
-        Copy => send_key(tx, KeyCode::Copy),
-        Paste => paste_now(tx, clip),
-        Cut => send_key(tx, KeyCode::Cut),
-        Undo => send_key(tx, KeyCode::Undo),
+    }
+}
+
+const MENU_HOME: usize = 100;
+const MENU_APP_SWITCHER: usize = 101;
+const MENU_LOCK: usize = 102;
+const MENU_BACK: usize = 103;
+const MENU_ROTATE_LEFT: usize = 104;
+const MENU_ROTATE_RIGHT: usize = 105;
+const MENU_SCREENSHOT: usize = 106;
+const MENU_COPY: usize = 107;
+const MENU_PASTE: usize = 108;
+
+const MENU_PRESET_QUALITY: usize = 200;
+const MENU_PRESET_BALANCED: usize = 201;
+const MENU_PRESET_ULTRA_120: usize = 202;
+const MENU_PRESET_NATIVE_120: usize = 203;
+const MENU_PRESET_LATENCY: usize = 204;
+
+const MENU_FPS_45: usize = 300;
+const MENU_FPS_60: usize = 301;
+const MENU_FPS_90: usize = 302;
+const MENU_FPS_120: usize = 303;
+
+const MENU_RES_1440: usize = 400;
+const MENU_RES_1800: usize = 401;
+const MENU_RES_2160: usize = 402;
+const MENU_RES_NATIVE: usize = 403;
+
+const MENU_BITRATE_16: usize = 500;
+const MENU_BITRATE_25: usize = 501;
+const MENU_BITRATE_35: usize = 502;
+const MENU_BITRATE_40: usize = 503;
+const MENU_BITRATE_45: usize = 504;
+
+/// Add native menu-bar controls. Apple exposes iPhone Mirroring settings from
+/// the app menu rather than occupying permanent space beside the phone, so this
+/// follows the same interaction model.
+fn install_menus(window: &mut Window) {
+    let Ok(mut control) = Menu::new("控制") else {
+        return;
+    };
+    control.add_item("主屏幕", MENU_HOME).build();
+    control.add_item("App 切换器", MENU_APP_SWITCHER).build();
+    control.add_item("锁定 iPhone", MENU_LOCK).build();
+    control.add_item("返回", MENU_BACK).build();
+    control.add_separator();
+    control.add_item("向左旋转", MENU_ROTATE_LEFT).build();
+    control.add_item("向右旋转", MENU_ROTATE_RIGHT).build();
+    control.add_item("截屏", MENU_SCREENSHOT).build();
+    control.add_separator();
+    control.add_item("复制", MENU_COPY).build();
+    control.add_item("粘贴", MENU_PASTE).build();
+    window.add_menu(&control);
+
+    let Ok(mut presets) = Menu::new("预设") else {
+        return;
+    };
+    presets
+        .add_item("高画质 60 FPS · 2160p", MENU_PRESET_QUALITY)
+        .build();
+    presets
+        .add_item("平衡 60 FPS · 1800p", MENU_PRESET_BALANCED)
+        .build();
+    presets
+        .add_item("高画质 120 FPS · 2160p", MENU_PRESET_ULTRA_120)
+        .build();
+    presets
+        .add_item("原生分辨率 120 FPS", MENU_PRESET_NATIVE_120)
+        .build();
+    presets
+        .add_item("低延迟 60 FPS · 1280p", MENU_PRESET_LATENCY)
+        .build();
+
+    let Ok(mut fps) = Menu::new("帧率") else {
+        return;
+    };
+    fps.add_item("45 FPS", MENU_FPS_45).build();
+    fps.add_item("60 FPS", MENU_FPS_60).build();
+    fps.add_item("90 FPS", MENU_FPS_90).build();
+    fps.add_item("120 FPS", MENU_FPS_120).build();
+
+    let Ok(mut resolution) = Menu::new("分辨率") else {
+        return;
+    };
+    resolution.add_item("1440 长边", MENU_RES_1440).build();
+    resolution.add_item("1800 长边", MENU_RES_1800).build();
+    resolution.add_item("2160 长边", MENU_RES_2160).build();
+    resolution.add_item("原生分辨率", MENU_RES_NATIVE).build();
+
+    let Ok(mut bitrate) = Menu::new("码率") else {
+        return;
+    };
+    bitrate.add_item("16 Mbps", MENU_BITRATE_16).build();
+    bitrate.add_item("25 Mbps", MENU_BITRATE_25).build();
+    bitrate.add_item("35 Mbps", MENU_BITRATE_35).build();
+    bitrate.add_item("40 Mbps", MENU_BITRATE_40).build();
+    bitrate.add_item("45 Mbps", MENU_BITRATE_45).build();
+
+    let Ok(mut video) = Menu::new("视频设置") else {
+        return;
+    };
+    video.add_sub_menu("预设", &presets);
+    video.add_sub_menu("帧率", &fps);
+    video.add_sub_menu("分辨率", &resolution);
+    video.add_sub_menu("码率", &bitrate);
+    video.add_separator();
+    video
+        .add_item("修改后立即生效并自动保存", 599)
+        .enabled(false)
+        .build();
+    window.add_menu(&video);
+}
+
+fn apply_video_settings(
+    window: &mut Window,
+    tx: &Sender<InputFrame>,
+    settings: &Arc<Mutex<VideoSettings>>,
+    active_codec: &Arc<AtomicU8>,
+    update: impl FnOnce(&mut VideoSettings),
+) {
+    let value = {
+        let Ok(mut current) = settings.lock() else {
+            return;
+        };
+        update(&mut current);
+        *current = current.sanitized();
+        *current
+    };
+    value.save();
+    let codec = active_codec.load(Ordering::Relaxed);
+    let config = value.stream_config(codec);
+    let _ = tx.send(InputFrame::new(
+        MessageType::StartStream,
+        config.encode().to_vec(),
+    ));
+    window.set_target_fps(usize::from(value.target_fps.clamp(30, 240)));
+    window.set_title(&format!("ioscpy · {}", value.summary()));
+    crate::info!("video settings applied: {}", value.summary());
+}
+
+fn handle_menu_press(
+    id: usize,
+    window: &mut Window,
+    tx: &Sender<InputFrame>,
+    clip: &Arc<Mutex<ClipState>>,
+    settings: &Arc<Mutex<VideoSettings>>,
+    active_codec: &Arc<AtomicU8>,
+) {
+    match id {
+        MENU_HOME => send_action(tx, SystemAction::Home),
+        MENU_APP_SWITCHER => send_action(tx, SystemAction::AppSwitcher),
+        MENU_LOCK => send_action(tx, SystemAction::Lock),
+        MENU_BACK => send_action(tx, SystemAction::Back),
+        MENU_ROTATE_LEFT => send_action(tx, SystemAction::RotateLeft),
+        MENU_ROTATE_RIGHT => send_action(tx, SystemAction::RotateRight),
+        MENU_SCREENSHOT => send_action(tx, SystemAction::Screenshot),
+        MENU_COPY => send_key(tx, KeyCode::Copy),
+        MENU_PASTE => paste_now(tx, clip),
+        MENU_PRESET_QUALITY => apply_video_settings(window, tx, settings, active_codec, |v| {
+            *v = VideoSettings::quality_60()
+        }),
+        MENU_PRESET_BALANCED => apply_video_settings(window, tx, settings, active_codec, |v| {
+            *v = VideoSettings::balanced_60()
+        }),
+        MENU_PRESET_ULTRA_120 => apply_video_settings(window, tx, settings, active_codec, |v| {
+            *v = VideoSettings::ultra_120()
+        }),
+        MENU_PRESET_NATIVE_120 => apply_video_settings(window, tx, settings, active_codec, |v| {
+            *v = VideoSettings::native_120()
+        }),
+        MENU_PRESET_LATENCY => apply_video_settings(window, tx, settings, active_codec, |v| {
+            *v = VideoSettings::latency_60()
+        }),
+        MENU_FPS_45 => {
+            apply_video_settings(window, tx, settings, active_codec, |v| v.target_fps = 45)
+        }
+        MENU_FPS_60 => {
+            apply_video_settings(window, tx, settings, active_codec, |v| v.target_fps = 60)
+        }
+        MENU_FPS_90 => apply_video_settings(window, tx, settings, active_codec, |v| {
+            v.target_fps = 90;
+            v.bitrate_mbps = v.bitrate_mbps.max(35);
+        }),
+        MENU_FPS_120 => apply_video_settings(window, tx, settings, active_codec, |v| {
+            v.target_fps = 120;
+            v.bitrate_mbps = v.bitrate_mbps.max(40);
+        }),
+        MENU_RES_1440 => apply_video_settings(window, tx, settings, active_codec, |v| {
+            v.max_dimension = 1440
+        }),
+        MENU_RES_1800 => apply_video_settings(window, tx, settings, active_codec, |v| {
+            v.max_dimension = 1800
+        }),
+        MENU_RES_2160 => apply_video_settings(window, tx, settings, active_codec, |v| {
+            v.max_dimension = 2160
+        }),
+        MENU_RES_NATIVE => apply_video_settings(window, tx, settings, active_codec, |v| {
+            v.max_dimension = 4096
+        }),
+        MENU_BITRATE_16 => {
+            apply_video_settings(window, tx, settings, active_codec, |v| v.bitrate_mbps = 16)
+        }
+        MENU_BITRATE_25 => {
+            apply_video_settings(window, tx, settings, active_codec, |v| v.bitrate_mbps = 25)
+        }
+        MENU_BITRATE_35 => {
+            apply_video_settings(window, tx, settings, active_codec, |v| v.bitrate_mbps = 35)
+        }
+        MENU_BITRATE_40 => {
+            apply_video_settings(window, tx, settings, active_codec, |v| v.bitrate_mbps = 40)
+        }
+        MENU_BITRATE_45 => {
+            apply_video_settings(window, tx, settings, active_codec, |v| v.bitrate_mbps = 45)
+        }
+        _ => {}
     }
 }
 
@@ -579,15 +787,26 @@ impl FrameRenderer {
         frame: &DecodedFrame,
         content_w: usize,
         win_h: usize,
-        sidebar_down: Option<usize>,
+        toolbar_visible: bool,
+        toolbar_down: Option<usize>,
     ) -> Result<()> {
         match self.backend {
-            RenderBackend::NativeGpu => {
-                self.present_native_gpu(window, frame, content_w, win_h, sidebar_down)
-            }
-            RenderBackend::CpuBilinear => {
-                self.present_cpu(window, frame, content_w, win_h, sidebar_down)
-            }
+            RenderBackend::NativeGpu => self.present_native_gpu(
+                window,
+                frame,
+                content_w,
+                win_h,
+                toolbar_visible,
+                toolbar_down,
+            ),
+            RenderBackend::CpuBilinear => self.present_cpu(
+                window,
+                frame,
+                content_w,
+                win_h,
+                toolbar_visible,
+                toolbar_down,
+            ),
         }
     }
 
@@ -601,7 +820,8 @@ impl FrameRenderer {
         frame: &DecodedFrame,
         content_w: usize,
         win_h: usize,
-        sidebar_down: Option<usize>,
+        toolbar_visible: bool,
+        toolbar_down: Option<usize>,
     ) -> Result<()> {
         let content_aspect = content_w.max(1) as f64 / win_h.max(1) as f64;
         let frame_aspect = frame.width.max(1) as f64 / frame.height.max(1) as f64;
@@ -616,10 +836,17 @@ impl FrameRenderer {
                 ((frame.width as f64 / content_aspect).ceil() as usize).max(frame.height),
             )
         };
-        let sidebar_src = ((canvas_h as f64 * sidebar::WIDTH as f64 / win_h.max(1) as f64).round()
-            as usize)
-            .max(1);
-        let stride = canvas_w + sidebar_src;
+
+        // Normal portrait/landscape windows preserve the phone's exact aspect
+        // ratio. With the hover controls hidden there is no reason to allocate
+        // and copy a second full-resolution canvas: upload the decoder-owned
+        // frame directly to minifb's Metal texture.
+        if !toolbar_visible && canvas_w == frame.width && canvas_h == frame.height {
+            return window
+                .update_with_buffer(&frame.buf, frame.width, frame.height)
+                .context("failed to present a direct GPU frame");
+        }
+        let stride = canvas_w;
 
         self.combined.clear();
         self.combined.resize(stride * canvas_h, 0);
@@ -631,14 +858,17 @@ impl FrameRenderer {
             self.combined[dst..dst + frame.width]
                 .copy_from_slice(&frame.buf[src..src + frame.width]);
         }
-        sidebar::draw_into(
-            &mut self.combined,
-            stride,
-            canvas_w,
-            sidebar_src,
-            canvas_h,
-            sidebar_down,
-        );
+        if toolbar_visible {
+            let point_scale = canvas_h as f32 / win_h.max(1) as f32;
+            sidebar::draw_into(
+                &mut self.combined,
+                stride,
+                canvas_w,
+                canvas_h,
+                point_scale,
+                toolbar_down,
+            );
+        }
         window
             .update_with_buffer(&self.combined, stride, canvas_h)
             .context("failed to present a GPU-scaled frame")
@@ -650,30 +880,31 @@ impl FrameRenderer {
         frame: &DecodedFrame,
         content_w: usize,
         win_h: usize,
-        sidebar_down: Option<usize>,
+        toolbar_visible: bool,
+        toolbar_down: Option<usize>,
     ) -> Result<()> {
         let bs = backing_scale(window);
         let ow = (content_w as f32 * bs).max(1.0);
         let oh = (win_h as f32 * bs).max(1.0);
-        let down = (2600.0 / (ow + sidebar::WIDTH as f32 * bs))
-            .min(2600.0 / oh)
-            .min(1.0);
+        let down = (2600.0 / ow).min(2600.0 / oh).min(1.0);
         let content_px = ((ow * down) as usize).max(1);
         let total_h = ((oh * down) as usize).max(1);
-        let sidebar_px = ((sidebar::WIDTH as f32 * bs * down).round() as usize).max(1);
-        let stride = content_px + sidebar_px;
+        let stride = content_px;
 
         self.combined.clear();
         self.combined.resize(stride * total_h, 0);
         scale_frame(frame, content_px, total_h, stride, &mut self.combined);
-        sidebar::draw_into(
-            &mut self.combined,
-            stride,
-            content_px,
-            sidebar_px,
-            total_h,
-            sidebar_down,
-        );
+        if toolbar_visible {
+            let point_scale = total_h as f32 / win_h.max(1) as f32;
+            sidebar::draw_into(
+                &mut self.combined,
+                stride,
+                content_px,
+                total_h,
+                point_scale,
+                toolbar_down,
+            );
+        }
         window
             .update_with_buffer(&self.combined, stride, total_h)
             .context("failed to present a CPU-scaled frame")
@@ -688,7 +919,8 @@ pub fn run_window(
     stop: Arc<AtomicBool>,
     input_tx: Sender<InputFrame>,
     clip_in: Receiver<String>,
-    target_fps: u16,
+    video_settings: Arc<Mutex<VideoSettings>>,
+    active_codec: Arc<AtomicU8>,
     input_debug: bool,
 ) -> Result<()> {
     let first = match wait_for_first_frame(&frames, &stop) {
@@ -705,8 +937,15 @@ pub fn run_window(
     let short = first.width.min(first.height).max(1) as f32;
     let display_scale = ((sh * 0.92) / long).min((sw * 0.92) / short);
     // Size the first window exactly as a rotation to this shape would.
-    let (win_w, win_h) = scaled_fit(first.width, first.height, display_scale, sidebar::WIDTH);
-    let mut window = open_window(title, win_w, win_h, target_fps)?;
+    let initial_settings = video_settings
+        .lock()
+        .map(|value| *value)
+        .unwrap_or_default();
+    let target_fps = initial_settings.target_fps;
+    let (win_w, win_h) = scaled_fit(first.width, first.height, display_scale, 0);
+    let initial_title = format!("{title} · {}", initial_settings.summary());
+    let mut window = open_window(&initial_title, win_w, win_h, target_fps)?;
+    install_menus(&mut window);
     let clip = Arc::new(Mutex::new(ClipState::default()));
     install_key_monitor(input_tx.clone(), clip.clone());
     attach_text_input(&mut window, &input_tx);
@@ -716,7 +955,9 @@ pub fn run_window(
     let mut input = InputState::default();
     let mut renderer = FrameRenderer::new();
     let mut last_present_size = (0usize, 0usize);
-    let mut last_sidebar_down = None;
+    let mut last_toolbar_visible = false;
+    let mut last_toolbar_down = None;
+    let mut toolbar_until = Instant::now();
     let mut last_clip_poll = Instant::now();
     let mut present_window = Instant::now();
     let mut presented_frames = 0u64;
@@ -733,26 +974,49 @@ pub fn run_window(
         // recreating it is the reliable way to follow the rotation.
         if (current.width, current.height) != last_dims {
             last_dims = (current.width, current.height);
-            let (nw, nh) = scaled_fit(current.width, current.height, display_scale, sidebar::WIDTH);
+            let (nw, nh) = scaled_fit(current.width, current.height, display_scale, 0);
             let pos = window.get_position();
-            if let Ok(mut w) = open_window(title, nw, nh, target_fps) {
+            let settings = video_settings
+                .lock()
+                .map(|value| *value)
+                .unwrap_or_default();
+            let rotated_title = format!("{title} · {}", settings.summary());
+            if let Ok(mut w) = open_window(&rotated_title, nw, nh, settings.target_fps) {
                 w.set_position(pos.0, pos.1);
                 attach_text_input(&mut w, &input_tx);
+                install_menus(&mut w);
                 window = w;
                 last_present_size = (0, 0);
             }
         }
 
-        // Window points: the sidebar is a fixed-width strip on the right, the
-        // device frame and touch mapping get whatever's left.
         let (gw, gh) = window.get_size();
-        let content_w = gw.saturating_sub(sidebar::WIDTH).max(1);
+        let content_w = gw.max(1);
+
+        if let Some(menu_id) = window.is_menu_pressed() {
+            handle_menu_press(
+                menu_id,
+                &mut window,
+                &input_tx,
+                &clip,
+                &video_settings,
+                &active_codec,
+            );
+        }
+
+        if let Some(pos) = window.get_mouse_pos(MouseMode::Clamp) {
+            if pos.1 <= sidebar::HOVER_ZONE || input.toolbar_down.is_some() {
+                toolbar_until = Instant::now() + Duration::from_millis(850);
+            }
+        }
+        let toolbar_visible = Instant::now() <= toolbar_until || input.toolbar_down.is_some();
 
         let input_ctx = InputCtx {
             content_w,
             win_h: gh,
             tx: &input_tx,
             clip: &clip,
+            toolbar_visible,
             input_debug,
         };
         pump_input(&window, &current, &mut input, &input_ctx);
@@ -760,11 +1024,20 @@ pub fn run_window(
         pump_keys(&window, &input_tx, &clip);
 
         let window_changed = last_present_size != (gw, gh);
-        let sidebar_changed = last_sidebar_down != input.sidebar_down;
-        if frame_changed || window_changed || sidebar_changed {
-            renderer.present(&mut window, &current, content_w, gh, input.sidebar_down)?;
+        let toolbar_changed =
+            last_toolbar_visible != toolbar_visible || last_toolbar_down != input.toolbar_down;
+        if frame_changed || window_changed || toolbar_changed {
+            renderer.present(
+                &mut window,
+                &current,
+                content_w,
+                gh,
+                toolbar_visible,
+                input.toolbar_down,
+            )?;
             last_present_size = (gw, gh);
-            last_sidebar_down = input.sidebar_down;
+            last_toolbar_visible = toolbar_visible;
+            last_toolbar_down = input.toolbar_down;
             if frame_changed {
                 presented_frames += 1;
             }
@@ -775,6 +1048,10 @@ pub fn run_window(
             window.update();
         }
         if present_window.elapsed() >= Duration::from_secs(1) {
+            let target_fps = video_settings
+                .lock()
+                .map(|value| value.target_fps)
+                .unwrap_or(60);
             crate::debug!(
                 "present: {:.1} fps ({presented_frames} new frames, target {target_fps})",
                 presented_frames as f64 / present_window.elapsed().as_secs_f64()
@@ -802,27 +1079,24 @@ pub fn run_window(
 struct InputState {
     touching: bool,
     last: (f32, f32),
-    /// Index of the sidebar button the press started on, while still held.
-    sidebar_down: Option<usize>,
+    /// Index of the hover-toolbar button the press started on, while held.
+    toolbar_down: Option<usize>,
 }
 
 /// Per-frame input collaborators, bundled so `pump_input` and its helpers
 /// stay under the 4-parameter line instead of threading five separate
 /// references through each call.
 struct InputCtx<'a> {
-    /// Window points excluding the sidebar; touch coordinates are mapped
-    /// against this so the button panel never counts as part of the device
-    /// screen.
     content_w: usize,
     win_h: usize,
     tx: &'a Sender<InputFrame>,
     clip: &'a Arc<Mutex<ClipState>>,
+    toolbar_visible: bool,
     input_debug: bool,
 }
 
-/// Turn this frame's mouse state into touch messages, or, for a press that
-/// starts in the sidebar strip, a button action. Keyboard shortcuts are
-/// handled separately by the event monitor.
+/// Turn this frame's mouse state into touch messages, except when the press
+/// begins on the temporary top toolbar.
 fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx: &InputCtx) {
     let down = window.get_mouse_down(MouseButton::Left);
 
@@ -841,7 +1115,7 @@ fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx
             send_touch(ctx.tx, TouchPhase::Up, state.last.0, state.last.1);
             state.touching = false;
         }
-        state.sidebar_down = None;
+        state.toolbar_down = None;
         return;
     }
 
@@ -866,15 +1140,14 @@ fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx
         return;
     }
 
-    if state.sidebar_down.is_some() {
+    if state.toolbar_down.is_some() {
         return; // press started on a button; ignore drag until release
     }
 
     handle_fresh_press(pos, frame, state, ctx);
 }
 
-/// A press that wasn't already tracked as a touch or a held button: route it
-/// to a touch-down or a sidebar button depending on where it landed.
+/// Route a fresh press to the hover toolbar or the phone surface.
 fn handle_fresh_press(
     pos: (f32, f32),
     frame: &DecodedFrame,
@@ -882,18 +1155,21 @@ fn handle_fresh_press(
     ctx: &InputCtx,
 ) {
     let (mx, my) = pos;
-    if (mx as usize) < ctx.content_w {
-        let (nx, ny) = map_to_norm(mx, my, ctx.content_w, ctx.win_h, frame.width, frame.height);
-        if ctx.input_debug {
-            eprintln!("ioscpy: input host down x={nx:.4} y={ny:.4}");
+    if ctx.toolbar_visible {
+        if let Some(idx) = sidebar::hit_test(mx, my, ctx.content_w as f32) {
+            state.toolbar_down = Some(idx);
+            dispatch_sidebar_action(ctx.tx, ctx.clip, sidebar::BUTTONS[idx]);
+            return;
         }
-        send_touch(ctx.tx, TouchPhase::Down, nx, ny);
-        state.touching = true;
-        state.last = (nx, ny);
-    } else if let Some(idx) = sidebar::hit_test(mx - ctx.content_w as f32, my, ctx.win_h as f32) {
-        state.sidebar_down = Some(idx);
-        dispatch_sidebar_action(ctx.tx, ctx.clip, sidebar::BUTTONS[idx]);
     }
+
+    let (nx, ny) = map_to_norm(mx, my, ctx.content_w, ctx.win_h, frame.width, frame.height);
+    if ctx.input_debug {
+        eprintln!("ioscpy: input host down x={nx:.4} y={ny:.4}");
+    }
+    send_touch(ctx.tx, TouchPhase::Down, nx, ny);
+    state.touching = true;
+    state.last = (nx, ny);
 }
 
 fn send_touch(tx: &Sender<InputFrame>, phase: TouchPhase, x: f32, y: f32) {

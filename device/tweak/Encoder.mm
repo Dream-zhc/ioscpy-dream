@@ -84,8 +84,11 @@ BOOL IOSPYH264Available(void) {
 
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    // High profile gives screen text and gradients better quality per bit than
+    // Baseline. All supported host decoders use VideoToolbox/OpenH264 and accept
+    // it; AutoLevel lets the hardware choose the level required by 120 FPS.
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_H264_Baseline_AutoLevel);
+                         kVTProfileLevel_H264_High_AutoLevel);
 
     // Refresh a keyframe at least every few seconds (and bound by frame count) so
     // a host that joins mid-stream recovers quickly.

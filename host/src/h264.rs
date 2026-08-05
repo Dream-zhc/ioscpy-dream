@@ -71,14 +71,15 @@ impl H264Decoder {
                 let height = h as usize;
                 // the shim owns this buffer until the next decode, so copy it
                 // into a frame we own before returning
-                let bgra = unsafe { std::slice::from_raw_parts(out_ptr, width * height * 4) };
+                // VideoToolbox gives tightly packed BGRA bytes. On little-endian
+                // Apple silicon each pixel is therefore 0xAARRGGBB as a u32,
+                // exactly the layout minifb consumes (the high alpha byte is
+                // ignored). Copy whole pixels instead of rebuilding RGB one
+                // channel at a time.
+                let packed =
+                    unsafe { std::slice::from_raw_parts(out_ptr.cast::<u32>(), width * height) };
                 let mut buf = vec![0u32; width * height];
-                for (i, px) in buf.iter_mut().enumerate() {
-                    let b = bgra[i * 4] as u32;
-                    let g = bgra[i * 4 + 1] as u32;
-                    let r = bgra[i * 4 + 2] as u32;
-                    *px = (r << 16) | (g << 8) | b;
-                }
+                buf.copy_from_slice(packed);
                 Decoded::Frame(DecodedFrame { buf, width, height })
             }
             0 => Decoded::Pending,

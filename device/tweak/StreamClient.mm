@@ -527,10 +527,13 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
         _encoder = [[IOSPYH264Encoder alloc] init];
     }
     int width = 0, height = 0;
+    int captureToken = -1;
     double captureStart = streamNowMs();
-    IOSurfaceRef surface = IOSPYCaptureScreenSurface(_effectiveMaxDimension, &width, &height);
+    IOSurfaceRef surface = IOSPYCaptureScreenSurface(_effectiveMaxDimension, &width, &height,
+                                                      &captureToken);
     double captureMs = streamNowMs() - captureStart;
     if (!surface || width < 2 || height < 2) {
+        IOSPYReleaseCaptureSurface(captureToken);
         _droppedFrames++;
         return NO;
     }
@@ -549,6 +552,9 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                             keyframeInterval:MAX(_config.keyframe_interval_frames, 1)
                                forceKeyframe:forceKeyframe
                                   completion:^(NSData *avcc, BOOL isKey, BOOL hardError) {
+        // VideoToolbox has finished reading the IOSurface when this callback
+        // fires, so the capture queue may reuse its pool slot immediately.
+        IOSPYReleaseCaptureSurface(captureToken);
         double encodeMs = streamNowMs() - encodeStart;
         dispatch_async(self->_captureQueue, ^{
             if (epoch != self->_encoderEpoch) {
@@ -618,6 +624,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
         });
     }];
     if (!submitted) {
+        IOSPYReleaseCaptureSurface(captureToken);
         if (_h264InFlight > 0) {
             _h264InFlight--;
         }

@@ -336,7 +336,7 @@ fn print_stats(payload: &[u8], input_debug: bool) {
             stats.send_ms_avg,
         );
         crate::debug!(
-            "device input: route={} ready={} monitor={} sender=0x{:x}; touch={} submitted={} no-sender={} dispatched={} failures={}",
+            "device input: route={} ready={} monitor={} sender=0x{:x} source={}; touch={} submitted={} no-sender={} dispatched={} failures={}",
             if stats.input.route.is_empty() {
                 "unknown"
             } else {
@@ -345,6 +345,11 @@ fn print_stats(payload: &[u8], input_debug: bool) {
             stats.input.client_ready,
             stats.input.monitor_ready,
             stats.input.sender_id,
+            if stats.input.sender_source.is_empty() {
+                "unknown"
+            } else {
+                &stats.input.sender_source
+            },
             stats.input.touch_commands,
             stats.input.touch_submitted,
             stats.input.touch_without_sender,
@@ -353,7 +358,7 @@ fn print_stats(payload: &[u8], input_debug: bool) {
         );
         if input_debug {
             eprintln!(
-                "ioscpy: input device route={} ready={} sender=0x{:x} commands={} submitted={} no-sender={} failures={} last=phase:{} x:{:.4} y:{:.4}",
+                "ioscpy: input device route={} ready={} sender=0x{:x} source={} commands={} submitted={} no-sender={} failures={} last=phase:{} x:{:.4} y:{:.4}",
                 if stats.input.route.is_empty() {
                     "unknown"
                 } else {
@@ -361,6 +366,11 @@ fn print_stats(payload: &[u8], input_debug: bool) {
                 },
                 stats.input.client_ready,
                 stats.input.sender_id,
+                if stats.input.sender_source.is_empty() {
+                    "unknown"
+                } else {
+                    &stats.input.sender_source
+                },
                 stats.input.touch_commands,
                 stats.input.touch_submitted,
                 stats.input.touch_without_sender,

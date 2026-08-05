@@ -510,6 +510,8 @@ pub struct DeviceInputStats {
     #[serde(default)]
     pub sender_id: u64,
     #[serde(default)]
+    pub sender_source: String,
+    #[serde(default)]
     pub touch_commands: u64,
     #[serde(default)]
     pub touch_submitted: u64,

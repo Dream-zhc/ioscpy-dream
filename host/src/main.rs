@@ -26,9 +26,9 @@ mod wayland_compat;
 mod window;
 
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use crate::cli::{Cli, StreamProfile};
+use crate::config::VideoSettings;
 
 const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -124,14 +125,13 @@ fn stream_config(cli: &Cli, codec: u8) -> protocol::StreamConfig {
         config.target_fps = fps;
     }
     if config.target_fps >= 120 && cli.max_dimension.is_none() {
-        // 1080 long-edge was visibly soft on modern iPhones. A16-class devices
-        // sustain 120 capture/encode at a 1440 long edge in practice, while the
-        // adaptive controller can still step down if the actual queue/drop data
-        // shows pressure.
-        config.max_dimension = 1440;
-        config.bitrate_bps = config.bitrate_bps.max(25_000_000);
+        // FPS and image quality are independent controls. Never silently reduce
+        // resolution because the user selected 120 FPS; let device telemetry
+        // expose the actual limit instead.
+        config.max_dimension = config.max_dimension.max(2160);
+        config.bitrate_bps = config.bitrate_bps.max(40_000_000);
         config.keyframe_interval_frames = 120;
-        config.latency_mode = LatencyMode::HighRefresh;
+        config.latency_mode = LatencyMode::Quality;
     }
     if let Some(max_dimension) = cli.max_dimension {
         config.max_dimension = max_dimension;
@@ -147,6 +147,29 @@ fn stream_config(cli: &Cli, codec: u8) -> protocol::StreamConfig {
         .saturating_mul(u32::from(keyframe_seconds))
         .min(u32::from(u16::MAX)) as u16;
     config
+}
+
+fn cli_has_video_overrides(cli: &Cli) -> bool {
+    cli.profile.is_some()
+        || cli.fps.is_some()
+        || cli.max_dimension.is_some()
+        || cli.bitrate_mbps.is_some()
+        || cli.keyframe_seconds.is_some()
+}
+
+fn initial_video_settings(cli: &Cli) -> VideoSettings {
+    if !cli_has_video_overrides(cli) {
+        return VideoSettings::load();
+    }
+    let cfg = stream_config(cli, protocol::VIDEO_CODEC_H264);
+    VideoSettings {
+        target_fps: cfg.target_fps,
+        max_dimension: cfg.max_dimension,
+        bitrate_mbps: cfg.bitrate_bps / 1_000_000,
+        keyframe_seconds: (cfg.keyframe_interval_frames / cfg.target_fps.max(1)).max(1),
+        latency_mode: cfg.latency_mode,
+    }
+    .sanitized()
 }
 
 fn main() {
@@ -213,7 +236,7 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
 
     // Handshake-only diagnostic path, no window.
     if cli.handshake_only {
-        return run_connection_loop(cli, port, &stop, None, None, None);
+        return run_connection_loop(cli, port, &stop, None, None, None, None, None);
     }
 
     // Grab one frame for testing the stream path.
@@ -243,7 +266,7 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
         }
         println!("soak: running the streaming session for {secs}s, watching for reconnects…");
         let slot = window::new_frame_slot();
-        return run_connection_loop(cli, port, &stop, Some(slot), None, None);
+        return run_connection_loop(cli, port, &stop, Some(slot), None, None, None, None);
     }
 
     // Set the Dock icon on the main thread before the window opens, otherwise the
@@ -252,12 +275,16 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
 
     let slot = window::new_frame_slot();
     let (input_tx, input_rx) = mpsc::channel::<input::InputFrame>();
+    let video_settings = Arc::new(Mutex::new(initial_video_settings(cli)));
+    let active_codec = Arc::new(AtomicU8::new(protocol::VIDEO_CODEC_H264));
     // iPhone to Mac clipboard text goes from the net thread to the window thread,
     // which owns the pasteboard (and the main thread).
     let (clip_in_tx, clip_in_rx) = mpsc::channel::<String>();
     let net_slot = slot.clone();
     let net_stop = stop.clone();
     let net_cli = cli.clone();
+    let net_settings = video_settings.clone();
+    let net_codec = active_codec.clone();
     let net = thread::spawn(move || {
         if let Err(e) = run_connection_loop(
             &net_cli,
@@ -266,6 +293,8 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
             Some(net_slot),
             Some(input_rx),
             Some(clip_in_tx),
+            Some(&net_settings),
+            Some(&net_codec),
         ) {
             eprintln!("ioscpy: error: {e:#}");
         }
@@ -273,14 +302,14 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
     });
 
     let window_title = format!("ioscpy v{HOST_VERSION}");
-    let display_fps = stream_config(cli, protocol::VIDEO_CODEC_H264).target_fps;
     let result = window::run_window(
         &window_title,
         slot,
         stop.clone(),
         input_tx,
         clip_in_rx,
-        display_fps,
+        video_settings,
+        active_codec,
         cli.input_debug,
     );
     stop.store(true, Ordering::Relaxed);
@@ -298,6 +327,8 @@ fn run_connection_loop(
     frame_sink: Option<window::FrameSlot>,
     input_rx: Option<mpsc::Receiver<input::InputFrame>>,
     clip_in: Option<mpsc::Sender<String>>,
+    runtime_settings: Option<&Arc<Mutex<VideoSettings>>>,
+    active_codec: Option<&Arc<AtomicU8>>,
 ) -> Result<()> {
     let pair_token = pair_token(cli)?;
     let mut first = true;
@@ -370,7 +401,12 @@ fn run_connection_loop(
         } else {
             protocol::VIDEO_CODEC_MJPEG
         };
-        let stream_config = stream_config(cli, codec);
+        if let Some(active_codec) = active_codec {
+            active_codec.store(codec, Ordering::Relaxed);
+        }
+        let stream_config = runtime_settings
+            .and_then(|settings| settings.lock().ok().map(|value| value.stream_config(codec)))
+            .unwrap_or_else(|| stream_config(cli, codec));
         debug!(
             "stream config: codec={} fps={} max={} bitrate={} keyint={} mode={:?}",
             stream_config.codec,
@@ -799,8 +835,9 @@ mod stream_profile_tests {
         let cli = parse(&["ioscpy", "--profile", "high-refresh", "--fps", "120"]);
         let config = stream_config(&cli, protocol::VIDEO_CODEC_H264);
         assert_eq!(config.target_fps, 120);
-        assert_eq!(config.max_dimension, 1440);
-        assert_eq!(config.bitrate_bps, 25_000_000);
+        assert_eq!(config.max_dimension, 2160);
+        assert_eq!(config.bitrate_bps, 40_000_000);
+        assert_eq!(config.latency_mode, protocol::LatencyMode::Quality);
     }
 
     #[test]

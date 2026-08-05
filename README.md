@@ -267,15 +267,22 @@ and `dpkg-deb`.
 
 ### Stream tuning and benchmarks
 
-The default remains the original compatibility profile (45 FPS, 1600 px longest
-side). Newer builds can negotiate stream settings with the device:
+Run `ioscpy` with no arguments. Move the pointer to the top of the mirror for
+Home and App Switcher controls. Use the native **视频设置** menu to change the
+preset, frame rate, resolution, or bitrate; changes restart only the video stream,
+take effect immediately, and persist for the next launch. The first-run default is
+60 FPS, 2160 long edge, 25 Mbps.
+
+The high-quality 120 FPS preset requests 2160 long edge at 40 Mbps without
+automatic resolution reduction. Native resolution 120 FPS is also available for
+testing the actual device limit. Command-line overrides remain for automation:
 
 ```bash
 ioscpy --profile quality        # 60 FPS, 2160 long edge, 25 Mbps
 ioscpy --profile balanced       # 60 FPS, 1800 long edge, 16 Mbps
 ioscpy --profile latency        # 60 FPS, 1280 long edge, short queues
 ioscpy --profile high-refresh   # 90 FPS, 1600 long edge, 18 Mbps
-ioscpy --profile high-refresh --fps 120  # 1440 long edge, 25 Mbps
+ioscpy --profile high-refresh --fps 120  # 2160 long edge, 40 Mbps
 ioscpy --input-debug            # trace Mac touch sends and device HID submission
 ```
 

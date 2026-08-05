@@ -13,7 +13,8 @@ pub enum StreamProfile {
     Balanced,
     /// Short queues and a smaller frame for lower latency.
     Latency,
-    /// Experimental 90 FPS mode; 120 FPS is selectable with --fps 120.
+    /// Experimental 90 FPS mode; --fps 120 keeps a 2160 long edge unless
+    /// explicitly overridden.
     HighRefresh,
 }
 
@@ -24,6 +25,7 @@ pub enum StreamProfile {
     about = "Mirror and control a jailbroken iPhone from macOS over USB",
     long_about = "ioscpy mirrors and controls a jailbroken iPhone from macOS over USB.\n\
                   Run with no arguments to auto-connect the single attached device.\n\
+                  Video settings are available from the macOS menu and persist.\n\
                   All core features (screen, mouse, keyboard, clipboard, shortcuts,\n\
                   orientation, reconnect) are enabled by default."
 )]

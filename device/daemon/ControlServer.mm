@@ -13,7 +13,7 @@
 #import <unistd.h>
 #import <errno.h>
 
-NSString *const IOSPYDaemonVersion = @"0.2.0-dream.2";
+NSString *const IOSPYDaemonVersion = @"0.2.0-dream.3";
 
 @implementation IOSPYControlServer {
     uint16_t _port;
@@ -257,6 +257,19 @@ NSString *const IOSPYDaemonVersion = @"0.2.0-dream.2";
                             dispatch_semaphore_signal(pumpDone);
                         });
                     }
+                } else {
+                    // Live video reconfiguration. The host keeps the authenticated
+                    // control connection open and sends a fresh START_STREAM when
+                    // the user changes FPS, resolution, or bitrate. The tweak
+                    // atomically stops its timer/encoder and starts with the new
+                    // config, so input and clipboard remain uninterrupted.
+                    IOSPYStreamConfig config = IOSPYParseStreamConfig(payload);
+                    BOOL h264 = (config.codec == IOSPY_VIDEO_CODEC_H264);
+                    [[IOSPYFrameIngest shared] setVideoReliable:h264];
+                    [[IOSPYFrameIngest shared] tellTweakStartPayload:payload];
+                    NSLog(@"[ioscpyd] stream reconfigured (codec=%s fps=%u max=%u bitrate=%u)",
+                          h264 ? "h264" : "mjpeg", config.target_fps,
+                          config.max_dimension, config.bitrate_bps);
                 }
                 break;
             case IOSPYMsgStopStream:

@@ -17,6 +17,7 @@ typedef uint32_t IOOptionBits;
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 typedef struct __IOHIDEventSystemConnection *IOHIDEventSystemConnectionRef;
+typedef struct __IOHIDServiceClient *IOHIDServiceClientRef;
 
 extern "C" {
 IOHIDEventRef IOHIDEventCreateDigitizerEvent(CFAllocatorRef allocator, uint64_t timeStamp,
@@ -66,6 +67,7 @@ void IOHIDEventSystemClientRegisterEventCallback(IOHIDEventSystemClientRef, void
 #define kFieldEventBuiltIn 0x00000004
 
 static uint64_t gSenderID = 0;
+static BOOL gSenderFromRegistry = NO;
 static IOHIDEventSystemClientRef gClient = NULL;
 static IOHIDEventSystemClientRef gMonitor = NULL;
 static IOHIDEventSystemConnectionRef gConnection = NULL;
@@ -80,6 +82,87 @@ static volatile uint64_t gTouchWithoutSender = 0;
 static volatile uint8_t gLastTouchPhase = 0xff;
 static volatile float gLastTouchX = 0.0f;
 static volatile float gLastTouchY = 0.0f;
+
+typedef CFArrayRef (*IOSPYCopyServicesFn)(IOHIDEventSystemClientRef);
+typedef Boolean (*IOSPYServiceConformsFn)(IOHIDServiceClientRef, uint32_t, uint32_t);
+typedef CFTypeRef (*IOSPYServiceRegistryIDFn)(IOHIDServiceClientRef);
+typedef CFTypeRef (*IOSPYServiceCopyPropertyFn)(IOHIDServiceClientRef, CFStringRef);
+
+// Resolve the built-in touch panel before the first physical touch. BackBoard's
+// sender id for a HID service is its registry id; obtaining it here removes the
+// old requirement to touch the phone once before remote input starts working.
+// Every symbol is loaded dynamically because these service APIs moved between
+// public/private header sets across iOS releases.
+static void discoverDigitizerSenderID(IOHIDEventSystemClientRef client) {
+    if (gSenderID != 0 || !client) {
+        return;
+    }
+    IOSPYCopyServicesFn copyServices =
+        (IOSPYCopyServicesFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCopyServices");
+    IOSPYServiceConformsFn conforms =
+        (IOSPYServiceConformsFn)dlsym(RTLD_DEFAULT, "IOHIDServiceClientConformsTo");
+    IOSPYServiceRegistryIDFn registryID =
+        (IOSPYServiceRegistryIDFn)dlsym(RTLD_DEFAULT, "IOHIDServiceClientGetRegistryID");
+    IOSPYServiceCopyPropertyFn copyProperty =
+        (IOSPYServiceCopyPropertyFn)dlsym(RTLD_DEFAULT, "IOHIDServiceClientCopyProperty");
+    if (!copyServices || !conforms || !registryID) {
+        return;
+    }
+
+    CFArrayRef services = copyServices(client);
+    if (!services) {
+        return;
+    }
+    uint64_t fallback = 0;
+    CFIndex count = CFArrayGetCount(services);
+    for (CFIndex i = 0; i < count; i++) {
+        IOHIDServiceClientRef service =
+            (IOHIDServiceClientRef)CFArrayGetValueAtIndex(services, i);
+        // HID Digitizers page (0x0D), Touch Screen usage (0x04).
+        if (!service || !conforms(service, 0x0D, 0x04)) {
+            continue;
+        }
+        CFTypeRef value = registryID(service);
+        uint64_t candidate = 0;
+        if (value && CFGetTypeID(value) == CFNumberGetTypeID()) {
+            CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &candidate);
+        }
+        if (candidate == 0) {
+            continue;
+        }
+        if (fallback == 0) {
+            fallback = candidate;
+        }
+
+        BOOL builtIn = NO;
+        if (copyProperty) {
+            CFTypeRef property = copyProperty(service, CFSTR("Built-In"));
+            if (property) {
+                if (CFGetTypeID(property) == CFBooleanGetTypeID()) {
+                    builtIn = CFBooleanGetValue((CFBooleanRef)property);
+                } else if (CFGetTypeID(property) == CFNumberGetTypeID()) {
+                    int number = 0;
+                    CFNumberGetValue((CFNumberRef)property, kCFNumberIntType, &number);
+                    builtIn = number != 0;
+                }
+                CFRelease(property);
+            }
+        }
+        if (builtIn) {
+            gSenderID = candidate;
+            break;
+        }
+    }
+    if (gSenderID == 0) {
+        gSenderID = fallback;
+    }
+    CFRelease(services);
+    if (gSenderID != 0) {
+        gSenderFromRegistry = YES;
+        NSLog(@"[ioscpyhook] discovered digitizer senderID 0x%llx from HID registry",
+              gSenderID);
+    }
+}
 
 // Resolve SpringBoard's privileged event-routing connection dynamically. This
 // route is accepted on systems where direct IOHIDEventSystemClient dispatch can
@@ -116,9 +199,13 @@ static void routingConnectionInit(void) {
 // Learn the real digitizer sender id from the first physical touch. Some builds
 // drop injected events without it.
 static void senderCallback(void *target, void *refcon, void *service, IOHIDEventRef event) {
-    if (gSenderID == 0 && IOHIDEventGetType(event) == kIOHIDEventTypeDigitizer) {
-        gSenderID = IOHIDEventGetSenderID(event);
-        NSLog(@"[ioscpyhook] captured digitizer senderID 0x%llx", gSenderID);
+    if (IOHIDEventGetType(event) == kIOHIDEventTypeDigitizer) {
+        uint64_t sender = IOHIDEventGetSenderID(event);
+        if (sender != 0 && sender != gSenderID) {
+            gSenderID = sender;
+            gSenderFromRegistry = NO;
+            NSLog(@"[ioscpyhook] confirmed digitizer senderID 0x%llx from touch", gSenderID);
+        }
     }
 }
 
@@ -134,6 +221,7 @@ static void hidInit(void) {
         gMonitor = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
     }
     if (gMonitor) {
+        discoverDigitizerSenderID(gMonitor);
         IOHIDEventSystemClientRegisterEventCallback(gMonitor, (void *)senderCallback, NULL, NULL);
         IOHIDEventSystemClientScheduleWithRunLoop(gMonitor, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     }
@@ -172,6 +260,8 @@ NSDictionary *IOSPYInputDiagnostics(void) {
         @"client_ready": @((gClient != NULL) || (gConnection != NULL)),
         @"monitor_ready": @(gMonitor != NULL),
         @"sender_id": @(gSenderID),
+        @"sender_source": gSenderID == 0 ? @"none" :
+            (gSenderFromRegistry ? @"registry" : @"touch"),
         @"touch_commands": @(gTouchCommands),
         @"touch_submitted": @(gTouchSubmitted),
         @"touch_without_sender": @(gTouchWithoutSender),
