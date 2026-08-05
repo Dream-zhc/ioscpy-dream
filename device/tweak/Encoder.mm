@@ -76,13 +76,8 @@ BOOL IOSPYHardwareVideoAvailable(uint8_t codec) {
     };
 
     CMVideoCodecType codecType = codec == 2 ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
-    NSDictionary *encoderSpec = @{
-        (__bridge NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
-        (__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
-    };
     OSStatus s = VTCompressionSessionCreate(kCFAllocatorDefault, width, height,
-                                            codecType,
-                                            (__bridge CFDictionaryRef)encoderSpec,
+                                            codecType, NULL,
                                             (__bridge CFDictionaryRef)srcAttrs, NULL,
                                             NULL, NULL, &_session);
     if (s != noErr || !_session) {
