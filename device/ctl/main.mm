@@ -16,6 +16,8 @@
 
 extern char **environ;
 
+static NSString *const kLanConfigPath = @"/var/mobile/Library/Preferences/com.ioscpy.lan.plist";
+
 static int connectLoopback(uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -155,6 +157,58 @@ static int cmdExportDiagnostics(void) {
     return rc;
 }
 
+static NSString *randomPairToken(void) {
+    uint8_t bytes[24];
+    arc4random_buf(bytes, sizeof(bytes));
+    NSMutableString *token = [NSMutableString stringWithCapacity:sizeof(bytes) * 2];
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        [token appendFormat:@"%02x", bytes[i]];
+    }
+    return token;
+}
+
+static int cmdLanEnable(NSString *bindAddress) {
+    struct in_addr parsed;
+    if (inet_pton(AF_INET, bindAddress.UTF8String, &parsed) != 1 ||
+        [bindAddress isEqualToString:@"127.0.0.1"]) {
+        fprintf(stderr, "lan-enable requires a non-loopback IPv4 bind address\n");
+        return 2;
+    }
+    NSString *token = randomPairToken();
+    NSDictionary *config = @{@"BindAddress": bindAddress, @"PairToken": token};
+    if (![config writeToFile:kLanConfigPath atomically:YES]) {
+        fprintf(stderr, "could not write %s\n", kLanConfigPath.UTF8String);
+        return 1;
+    }
+    runShell([NSString stringWithFormat:@"chmod 600 %@; chown mobile:mobile %@",
+                                         kLanConfigPath, kLanConfigPath]);
+    int rc = cmdRestartDaemon();
+    if (rc == 0) {
+        printf("LAN enabled on %s:%u\n", bindAddress.UTF8String, IOSPY_DEFAULT_PORT);
+        printf("Pair token (store this in a Mac file with mode 600):\n%s\n", token.UTF8String);
+        printf("Warning: authenticated prototype; video/control traffic is not encrypted yet.\n");
+    }
+    return rc;
+}
+
+static int cmdLanDisable(void) {
+    [[NSFileManager defaultManager] removeItemAtPath:kLanConfigPath error:nil];
+    return cmdRestartDaemon();
+}
+
+static int cmdLanStatus(void) {
+    NSDictionary *config = [NSDictionary dictionaryWithContentsOfFile:kLanConfigPath];
+    if (!config) {
+        printf("LAN disabled (loopback/USB only)\n");
+        return 1;
+    }
+    printf("LAN configured on %s:%u\n",
+           [config[@"BindAddress"] description].UTF8String, IOSPY_DEFAULT_PORT);
+    printf("pair token present: %s\n",
+           [config[@"PairToken"] length] >= 16 ? "yes" : "no/invalid");
+    return 0;
+}
+
 static void usage(void) {
     printf("usage: ioscpyctl <command>\n");
     printf("  status              device + daemon + tweak summary\n");
@@ -164,6 +218,9 @@ static void usage(void) {
     printf("  reload-hooks        respring to reload the tweak\n");
     printf("  repair-permissions  fix exec bits / ownership\n");
     printf("  export-diagnostics  bundle logs into /tmp\n");
+    printf("  lan-enable [ADDR]   enable paired LAN TCP (default 0.0.0.0)\n");
+    printf("  lan-disable         return to loopback/USB-only mode\n");
+    printf("  lan-status          show LAN configuration without printing token\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -188,6 +245,13 @@ int main(int argc, char *argv[]) {
             return cmdRepairPermissions();
         } else if ([cmd isEqualToString:@"export-diagnostics"]) {
             return cmdExportDiagnostics();
+        } else if ([cmd isEqualToString:@"lan-enable"]) {
+            NSString *bind = argc >= 3 ? [NSString stringWithUTF8String:argv[2]] : @"0.0.0.0";
+            return cmdLanEnable(bind);
+        } else if ([cmd isEqualToString:@"lan-disable"]) {
+            return cmdLanDisable();
+        } else if ([cmd isEqualToString:@"lan-status"]) {
+            return cmdLanStatus();
         }
         usage();
         return 2;

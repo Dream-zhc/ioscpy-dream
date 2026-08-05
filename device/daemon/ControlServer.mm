@@ -18,6 +18,9 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
 @implementation IOSPYControlServer {
     uint16_t _port;
     int _listenFd;
+    BOOL _lanEnabled;
+    NSString *_bindAddress;
+    NSString *_pairToken;
 }
 
 - (instancetype)initWithPort:(uint16_t)port {
@@ -29,6 +32,26 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
 }
 
 - (BOOL)startAndReturnError:(NSError **)error {
+    _lanEnabled = NO;
+    _bindAddress = @"127.0.0.1";
+    _pairToken = nil;
+    NSDictionary *lan = [NSDictionary dictionaryWithContentsOfFile:
+        @"/var/mobile/Library/Preferences/com.ioscpy.lan.plist"];
+    NSString *requestedBind = [lan[@"BindAddress"] isKindOfClass:[NSString class]]
+                                  ? lan[@"BindAddress"] : nil;
+    NSString *requestedToken = [lan[@"PairToken"] isKindOfClass:[NSString class]]
+                                   ? lan[@"PairToken"] : nil;
+    struct in_addr configuredAddress;
+    if (requestedBind.length > 0 && requestedToken.length >= 16 &&
+        inet_pton(AF_INET, requestedBind.UTF8String, &configuredAddress) == 1 &&
+        ![requestedBind isEqualToString:@"127.0.0.1"]) {
+        _lanEnabled = YES;
+        _bindAddress = [requestedBind copy];
+        _pairToken = [requestedToken copy];
+    } else if (lan) {
+        NSLog(@"[ioscpyd] ignoring invalid LAN configuration; staying loopback-only");
+    }
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return [self failWith:error message:@"socket() failed"];
@@ -41,11 +64,16 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(_port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 only, never public
+    if (inet_pton(AF_INET, _bindAddress.UTF8String, &addr.sin_addr) != 1) {
+        close(fd);
+        return [self failWith:error message:@"invalid bind address"];
+    }
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
-        return [self failWith:error message:[NSString stringWithFormat:@"bind 127.0.0.1:%u failed (%s)", _port, strerror(errno)]];
+        return [self failWith:error
+                      message:[NSString stringWithFormat:@"bind %@:%u failed (%s)",
+                                                         _bindAddress, _port, strerror(errno)]];
     }
     if (listen(fd, 4) != 0) {
         close(fd);
@@ -53,8 +81,10 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
     }
 
     _listenFd = fd;
-    NSLog(@"[ioscpyd] listening on 127.0.0.1:%u", _port);
-    printf("[ioscpyd] listening on 127.0.0.1:%u\n", _port);
+    NSLog(@"[ioscpyd] listening on %@:%u%@", _bindAddress, _port,
+          _lanEnabled ? @" (paired LAN prototype)" : @"");
+    printf("[ioscpyd] listening on %s:%u%s\n", _bindAddress.UTF8String, _port,
+           _lanEnabled ? " (paired LAN prototype)" : "");
     fflush(stdout);
     return YES;
 }
@@ -88,12 +118,13 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
         // a backlog build up on the wire.
         int sndbuf = 256 * 1024;
         setsockopt(client, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-        [self handleClient:client];
+        BOOL peerIsLoopback = ntohl(peer.sin_addr.s_addr) == INADDR_LOOPBACK;
+        [self handleClient:client peerIsLoopback:peerIsLoopback];
         close(client);
     }
 }
 
-- (void)handleClient:(int)fd {
+- (void)handleClient:(int)fd peerIsLoopback:(BOOL)peerIsLoopback {
     IOSPYFrameHeader hdr;
     NSData *payload = nil;
 
@@ -105,6 +136,21 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
     if (hdr.type != IOSPYMsgHello) {
         [self sendError:fd code:@"BAD_HANDSHAKE" message:@"expected HELLO"];
         return;
+    }
+
+    if (_lanEnabled && !peerIsLoopback) {
+        id helloObject = payload.length
+                             ? [NSJSONSerialization JSONObjectWithData:payload options:0 error:nil]
+                             : nil;
+        NSDictionary *hello = [helloObject isKindOfClass:[NSDictionary class]]
+                                  ? helloObject : nil;
+        NSString *got = [hello[@"pair_token"] isKindOfClass:[NSString class]]
+                            ? hello[@"pair_token"] : nil;
+        if (!got || ![got isEqualToString:_pairToken]) {
+            [self sendError:fd code:@"PAIR_REQUIRED" fatal:YES
+                    message:@"LAN pairing token missing or invalid"];
+            return;
+        }
     }
 
     NSLog(@"[ioscpyd] client connected, sending HELLO_ACK");
@@ -283,6 +329,7 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
         @"clipboard": @([[IOSPYFrameIngest shared] tweakConnected]),
         @"keyboard": @([[IOSPYFrameIngest shared] tweakConnected]),
         @"orientation": @NO,
+        @"lan": @(_lanEnabled),
     };
 }
 

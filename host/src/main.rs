@@ -60,6 +60,27 @@ struct BenchReport {
     device: Option<protocol::DeviceStreamStats>,
 }
 
+fn pair_token(cli: &Cli) -> Result<Option<String>> {
+    let token = if let Some(path) = cli.pair_token_file.as_deref() {
+        Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("could not read LAN pairing token from {path}"))?,
+        )
+    } else {
+        std::env::var("IOSCPY_PAIR_TOKEN").ok()
+    };
+    match token {
+        Some(token) => {
+            let token = token.trim().to_string();
+            if token.len() < 16 {
+                bail!("LAN pairing token must contain at least 16 characters");
+            }
+            Ok(Some(token))
+        }
+        None => Ok(None),
+    }
+}
+
 fn stream_config(cli: &Cli, codec: u8) -> protocol::StreamConfig {
     use protocol::{LatencyMode, StreamConfig};
 
@@ -272,6 +293,7 @@ fn run_connection_loop(
     input_rx: Option<mpsc::Receiver<input::InputFrame>>,
     clip_in: Option<mpsc::Sender<String>>,
 ) -> Result<()> {
+    let pair_token = pair_token(cli)?;
     let mut first = true;
     while !stop.load(Ordering::Relaxed) {
         // The forward has to outlive the session, so keep it in scope here.
@@ -297,7 +319,7 @@ fn run_connection_loop(
         stream.set_read_timeout(Some(Duration::from_secs(8))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(8))).ok();
 
-        let ack = match protocol::handshake(&mut stream, HOST_VERSION) {
+        let ack = match protocol::handshake(&mut stream, HOST_VERSION, pair_token.as_deref()) {
             Ok(ack) => ack,
             Err(e) => {
                 if cli.addr.is_some() {
@@ -386,8 +408,9 @@ fn cmd_snapshot(cli: &Cli, port: u16, path: &str) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(8))).ok();
 
-    let ack =
-        protocol::handshake(&mut stream, HOST_VERSION).context("handshake with ioscpyd failed")?;
+    let pair_token = pair_token(cli)?;
+    let ack = protocol::handshake(&mut stream, HOST_VERSION, pair_token.as_deref())
+        .context("handshake with ioscpyd failed")?;
     health::print_capabilities(&ack);
     if ack.capabilities.stream_backends.is_empty() {
         warn!("the phone side isn't fully up yet, so the screen might not show. Respring the phone (or reinstall ioscpy from Sileo) and reconnect.");
@@ -433,8 +456,9 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
-    let ack =
-        protocol::handshake(&mut stream, HOST_VERSION).context("handshake with ioscpyd failed")?;
+    let pair_token = pair_token(cli)?;
+    let ack = protocol::handshake(&mut stream, HOST_VERSION, pair_token.as_deref())
+        .context("handshake with ioscpyd failed")?;
     if ack.capabilities.stream_backends.is_empty() {
         warn!("the phone side isn't fully up yet, so the screen might not show. Respring the phone (or reinstall ioscpy from Sileo) and reconnect.");
     }
@@ -615,7 +639,9 @@ fn cmd_action(cli: &Cli, port: u16, code: u16) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(6))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(6))).ok();
 
-    let ack = protocol::handshake(&mut stream, HOST_VERSION).context("handshake failed")?;
+    let pair_token = pair_token(cli)?;
+    let ack = protocol::handshake(&mut stream, HOST_VERSION, pair_token.as_deref())
+        .context("handshake failed")?;
     println!("input backends: {:?}", ack.capabilities.input_backends);
     let action_config = stream_config(cli, protocol::VIDEO_CODEC_MJPEG).encode();
     protocol::write_frame(

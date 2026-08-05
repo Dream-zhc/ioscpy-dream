@@ -143,8 +143,17 @@
                     }
                     if (hostFd >= 0 && hostLock) {
                         [hostLock lock];
-                        IOSPYWriteFrame(hostFd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0, payload);
+                        int rc = IOSPYTryWriteFrame(hostFd, IOSPYMsgVideoFrame,
+                                                    IOSPY_CHANNEL_VIDEO, 0, payload);
                         [hostLock unlock];
+                        if (rc == 0) {
+                            // Preserve control responsiveness under Wi-Fi/host
+                            // backpressure. Dropping an inter-frame requires a
+                            // fresh keyframe before useful decoding can resume.
+                            [self sendToTweak:IOSPYMsgRequestKeyframe];
+                        } else if (rc < 0) {
+                            break;
+                        }
                     }
                 } else {
                     // MJPEG: keep only the latest frame, the pump drops stale ones.

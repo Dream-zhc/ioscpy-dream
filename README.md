@@ -285,6 +285,28 @@ send counters as JSON:
 ioscpy --bench 15 --profile balanced --bench-json bench.json
 ```
 
+### Paired LAN prototype
+
+USB remains the default and the daemon remains bound to `127.0.0.1`. On a device
+you control, LAN listening can be enabled explicitly:
+
+```bash
+ioscpyctl lan-enable 0.0.0.0
+```
+
+The command prints a random pairing token once. Store it in a mode-600 file on
+the Mac, then connect to the phone's LAN address:
+
+```bash
+chmod 600 ~/.ioscpy-pair-token
+ioscpy --addr 192.168.1.50:27183 --pair-token-file ~/.ioscpy-pair-token
+```
+
+Use `ioscpyctl lan-disable` to return to loopback/USB-only mode. This stage is an
+authenticated trusted-LAN prototype: the pairing token is required for remote
+connections, but the video/control stream is not yet encrypted. Do not expose
+the port to the internet or untrusted Wi-Fi.
+
 ## Scope
 
 ioscpy is for controlling your own jailbroken iPhone from your Mac and Linux (Debian, Ubuntu and Arch Linux) device, over the USB cable, on the same desk.

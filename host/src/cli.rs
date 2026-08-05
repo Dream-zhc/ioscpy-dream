@@ -79,9 +79,15 @@ pub struct Cli {
     pub no_keyboard: bool,
 
     // hidden options for debugging, not part of normal use
-    /// Connect directly to host:port, bypassing usbmux/iproxy (debugging only).
-    #[arg(long, value_name = "ADDR", hide = true)]
+    /// Connect directly to host:port. Non-loopback/LAN daemons require
+    /// --pair-token-file and must be explicitly enabled on the device.
+    #[arg(long, alias = "lan", value_name = "HOST:PORT")]
     pub addr: Option<String>,
+
+    /// Read the LAN pairing token from a local file. The token is not accepted as
+    /// a command-line value so it does not leak into shell history/process lists.
+    #[arg(long, value_name = "PATH", requires = "addr")]
+    pub pair_token_file: Option<String>,
 
     /// Override the daemon port (default 27183).
     #[arg(long, value_name = "PORT", hide = true)]

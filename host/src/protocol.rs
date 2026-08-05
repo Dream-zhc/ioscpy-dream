@@ -315,6 +315,8 @@ pub struct Hello {
     pub host_version: String,
     pub protocol_version: u16,
     pub nonce: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pair_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,6 +351,8 @@ pub struct Capabilities {
     pub keyboard: bool,
     #[serde(default)]
     pub orientation: bool,
+    #[serde(default)]
+    pub lan: bool,
 }
 
 /// Touch phase, the first byte of an INPUT_TOUCH payload.
@@ -547,12 +551,14 @@ pub fn random_hex(bytes: usize) -> String {
 pub fn handshake<S: Read + Write>(
     stream: &mut S,
     host_version: &str,
+    pair_token: Option<&str>,
 ) -> Result<HelloAck, ProtocolError> {
     let hello = Hello {
         role: "host",
         host_version: host_version.to_string(),
         protocol_version: PROTOCOL_VERSION,
         nonce: random_hex(16),
+        pair_token: pair_token.map(str::to_owned),
     };
     let body = serde_json::to_vec(&hello)?;
     write_frame(stream, MessageType::Hello, CHANNEL_CONTROL, 0, &body)?;

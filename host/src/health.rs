@@ -35,10 +35,11 @@ pub fn print_capabilities(ack: &HelloAck) {
     println!("  stream      {}", list_or_none(&c.stream_backends));
     println!("  input       {}", list_or_none(&c.input_backends));
     println!(
-        "  clipboard   {}    keyboard {}    orientation {}",
+        "  clipboard   {}    keyboard {}    orientation {}    lan {}",
         on_off(c.clipboard),
         on_off(c.keyboard),
         on_off(c.orientation),
+        on_off(c.lan),
     );
 }
 
