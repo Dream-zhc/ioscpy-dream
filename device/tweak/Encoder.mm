@@ -4,6 +4,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <arpa/inet.h>
+#import <limits.h>
 
 BOOL IOSPYH264Available(void) {
     // VideoToolbox is present on every device we target; the real gate is whether
@@ -16,6 +17,8 @@ BOOL IOSPYH264Available(void) {
 @implementation IOSPYH264Encoder {
     VTCompressionSessionRef _session;
     int _w, _h, _fps;
+    uint32_t _bitrate;
+    int _keyframeInterval;
     int64_t _pts;          // monotonic frame index for presentation timestamps
 }
 
@@ -27,6 +30,8 @@ BOOL IOSPYH264Available(void) {
         _session = NULL;
     }
     _w = _h = _fps = 0;
+    _bitrate = 0;
+    _keyframeInterval = 0;
 }
 
 - (void)dealloc {
@@ -47,8 +52,13 @@ BOOL IOSPYH264Available(void) {
     CFRelease(n);
 }
 
-- (BOOL)ensureSessionForWidth:(int)width height:(int)height fps:(int)fps {
-    if (_session && _w == width && _h == height && _fps == fps) {
+- (BOOL)ensureSessionForWidth:(int)width
+                       height:(int)height
+                          fps:(int)fps
+                      bitrate:(uint32_t)bitrate
+             keyframeInterval:(int)keyframeInterval {
+    if (_session && _w == width && _h == height && _fps == fps && _bitrate == bitrate &&
+        _keyframeInterval == keyframeInterval) {
         return YES;
     }
     [self invalidate];
@@ -79,12 +89,13 @@ BOOL IOSPYH264Available(void) {
 
     // Refresh a keyframe at least every few seconds (and bound by frame count) so
     // a host that joins mid-stream recovers quickly.
-    [self setProp:kVTCompressionPropertyKey_MaxKeyFrameInterval number:fps * 4];
-    [self setProp:kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration real:4.0];
+    [self setProp:kVTCompressionPropertyKey_MaxKeyFrameInterval number:keyframeInterval];
+    [self setProp:kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration
+             real:(double)keyframeInterval / MAX(fps, 1)];
     [self setProp:kVTCompressionPropertyKey_ExpectedFrameRate number:fps];
 
     // Cap bandwidth well under the MJPEG path; screen content stays far below it.
-    int avgBitrate = 8 * 1000 * 1000;
+    int avgBitrate = (int)MIN(bitrate, (uint32_t)INT_MAX);
     [self setProp:kVTCompressionPropertyKey_AverageBitRate number:avgBitrate];
     int byteCap = (int)((double)avgBitrate / 8.0 * 1.5);
     NSArray *limits = @[ @(byteCap), @(1.0) ]; // bytes per 1-second window
@@ -96,6 +107,8 @@ BOOL IOSPYH264Available(void) {
     _w = width;
     _h = height;
     _fps = fps;
+    _bitrate = bitrate;
+    _keyframeInterval = keyframeInterval;
     _pts = 0;
     NSLog(@"[ioscpyhook] H.264 session ready %dx%d @%dfps", width, height, fps);
     return YES;
@@ -112,6 +125,8 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
                     width:(int)width
                    height:(int)height
                       fps:(int)fps
+                  bitrate:(uint32_t)bitrate
+         keyframeInterval:(int)keyframeInterval
             forceKeyframe:(BOOL)forceKeyframe
                  keyframe:(BOOL *)outKeyframe {
     if (outKeyframe) {
@@ -120,7 +135,11 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
     if (!surface || width < 2 || height < 2) {
         return nil;
     }
-    if (![self ensureSessionForWidth:width height:height fps:fps]) {
+    if (![self ensureSessionForWidth:width
+                              height:height
+                                 fps:fps
+                             bitrate:bitrate
+                    keyframeInterval:keyframeInterval]) {
         return nil;
     }
 

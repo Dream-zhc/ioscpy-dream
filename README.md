@@ -265,6 +265,26 @@ make release             # host plus both device variants
 Requires Rust, Theos (`$THEOS`), libimobiledevice (`idevice_id`, `iproxy`), `ldid`,
 and `dpkg-deb`.
 
+### Stream tuning and benchmarks
+
+The default remains the original compatibility profile (45 FPS, 1600 px longest
+side). Newer builds can negotiate stream settings with the device:
+
+```bash
+ioscpy --profile balanced       # 60 FPS, general-purpose settings
+ioscpy --profile latency        # 60 FPS, smaller low-latency frame
+ioscpy --profile high-refresh   # experimental 90 FPS request
+ioscpy --profile high-refresh --fps 120 --max-dimension 1080
+```
+
+Advanced overrides include `--bitrate-mbps` and `--keyframe-seconds`. A headless
+benchmark can save both Host measurements and the latest device capture/encode/
+send counters as JSON:
+
+```bash
+ioscpy --bench 15 --profile balanced --bench-json bench.json
+```
+
 ## Scope
 
 ioscpy is for controlling your own jailbroken iPhone from your Mac and Linux (Debian, Ubuntu and Arch Linux) device, over the USB cable, on the same desk.

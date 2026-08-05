@@ -169,13 +169,14 @@ NSString *const IOSPYDaemonVersion = @"0.1.5";
             }
             case IOSPYMsgStartStream:
                 if (!streaming) {
-                    // 1-byte payload picks the codec (0/empty = MJPEG, 1 = H.264).
-                    uint8_t codec = (payload.length >= 1) ? ((const uint8_t *)payload.bytes)[0] : 0;
-                    BOOL h264 = (codec == IOSPY_VIDEO_CODEC_H264);
+                    IOSPYStreamConfig config = IOSPYParseStreamConfig(payload);
+                    BOOL h264 = (config.codec == IOSPY_VIDEO_CODEC_H264);
                     streaming = YES;
                     [[IOSPYFrameIngest shared] setVideoReliable:h264];
-                    [[IOSPYFrameIngest shared] tellTweakStartCodec:codec];
-                    NSLog(@"[ioscpyd] stream started (codec=%s)", h264 ? "h264" : "mjpeg");
+                    [[IOSPYFrameIngest shared] tellTweakStartPayload:payload];
+                    NSLog(@"[ioscpyd] stream started (codec=%s fps=%u max=%u bitrate=%u)",
+                          h264 ? "h264" : "mjpeg", config.target_fps,
+                          config.max_dimension, config.bitrate_bps);
                     if (!h264) {
                         // MJPEG: latest-only pump that drops stale frames under
                         // backpressure so motion stays smooth. H.264 goes out in

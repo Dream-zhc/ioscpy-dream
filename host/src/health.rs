@@ -66,7 +66,7 @@ pub fn run_session(
     frame_sink: Option<FrameSlot>,
     input_rx: Option<&Receiver<InputFrame>>,
     clip_in: Option<&Sender<String>>,
-    codec: u8,
+    stream_config: protocol::StreamConfig,
     suppress_keyboard: bool,
 ) -> Result<SessionEnd> {
     stream.set_read_timeout(None).ok();
@@ -74,14 +74,16 @@ pub fn run_session(
     let mut reader = stream.try_clone().context("clone control stream")?;
 
     // Ask the daemon to start streaming once we have somewhere to show it. The
-    // one-byte payload picks the codec.
+    // versioned payload picks codec and stream tuning; older daemons still read
+    // byte zero as the codec selector.
     if frame_sink.is_some() {
+        let payload = stream_config.encode();
         let _ = protocol::write_frame(
             &mut writer,
             MessageType::StartStream,
             CHANNEL_CONTROL,
             0,
-            &[codec],
+            &payload,
         );
     }
 
@@ -254,6 +256,7 @@ pub fn run_session(
             Ok(Incoming::Frame(frame)) => match frame.message_type() {
                 Some(MessageType::Pong) => last_pong = Instant::now(),
                 Some(MessageType::Log) => print_log(&frame.payload),
+                Some(MessageType::Stats) => print_stats(&frame.payload),
                 Some(MessageType::Error) => print_error(&frame.payload),
                 Some(MessageType::ClipboardChanged) => {
                     // [flags:u8][utf8]; hand the text to the window thread, which
@@ -297,6 +300,22 @@ pub fn run_session(
 fn print_log(payload: &[u8]) {
     if let Ok(log) = serde_json::from_slice::<LogMessage>(payload) {
         println!("device[{}] {}", log.level, log.message);
+    }
+}
+
+fn print_stats(payload: &[u8]) {
+    if let Ok(stats) = serde_json::from_slice::<protocol::DeviceStreamStats>(payload) {
+        crate::debug!(
+            "device stream: {}/{} captured, {} encoded, {} sent, {} dropped; capture {:.2} ms, encode {:.2} ms, send {:.2} ms",
+            stats.captured_frames,
+            stats.capture_ticks,
+            stats.encoded_frames,
+            stats.sent_frames,
+            stats.dropped_frames,
+            stats.capture_ms_avg,
+            stats.encode_ms_avg,
+            stats.send_ms_avg,
+        );
     }
 }
 

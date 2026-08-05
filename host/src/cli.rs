@@ -1,7 +1,21 @@
 //! Command-line flags. The normal case is just `ioscpy` with no flags, the rest
 //! is for support and debugging.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum StreamProfile {
+    /// Preserve the original 45 FPS / 1600 px behavior.
+    Legacy,
+    /// Favor detail at 60 FPS with a higher bitrate.
+    Quality,
+    /// General-purpose 60 FPS mode.
+    Balanced,
+    /// Short queues and a smaller frame for lower latency.
+    Latency,
+    /// Experimental 90 FPS mode; 120 FPS is selectable with --fps 120.
+    HighRefresh,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -29,6 +43,27 @@ pub struct Cli {
     /// Force MJPEG instead of H.264, in case H.264 acts up on some device.
     #[arg(long)]
     pub mjpeg: bool,
+
+    /// Select a stream tuning preset. With no preset or overrides, ioscpy keeps
+    /// the original 45 FPS / 1600 px behavior for compatibility.
+    #[arg(long, value_enum, value_name = "PROFILE")]
+    pub profile: Option<StreamProfile>,
+
+    /// Override the requested capture frame rate (1-240).
+    #[arg(long, value_name = "FPS", value_parser = clap::value_parser!(u16).range(1..=240))]
+    pub fps: Option<u16>,
+
+    /// Override the longest captured dimension in pixels (320-4096).
+    #[arg(long, value_name = "PIXELS", value_parser = clap::value_parser!(u16).range(320..=4096))]
+    pub max_dimension: Option<u16>,
+
+    /// Override the H.264 target bitrate in megabits per second (1-100).
+    #[arg(long, value_name = "MBPS", value_parser = clap::value_parser!(u32).range(1..=100))]
+    pub bitrate_mbps: Option<u32>,
+
+    /// Request an H.264 keyframe interval in seconds (1-30).
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u16).range(1..=30))]
+    pub keyframe_seconds: Option<u16>,
 
     /// Stay on native Wayland even when the compositor draws no window
     /// decorations for us (GNOME/mutter). By default ioscpy falls back to
@@ -65,6 +100,10 @@ pub struct Cli {
     /// time. For measuring stream performance.
     #[arg(long, value_name = "SECONDS", hide = true)]
     pub bench: Option<u64>,
+
+    /// Write the benchmark report as JSON. Use `-` to print JSON to stdout.
+    #[arg(long, value_name = "PATH", requires = "bench", hide = true)]
+    pub bench_json: Option<String>,
 
     /// Send one SYSTEM_ACTION code (1=Home 2=Lock 3=Wake 4=AppSwitcher) and report
     /// whether the stream survives it. For testing system actions headlessly.

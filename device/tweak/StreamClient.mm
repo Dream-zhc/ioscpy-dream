@@ -12,12 +12,13 @@
 #import <unistd.h>
 #import <UIKit/UIKit.h>
 
-// Capture tuning. We aim high on rate and let the serial capture queue settle the
-// real fps to whatever the device can sustain. Longest side is capped for
-// bandwidth and CPU.
-static const CGFloat kMaxDimension = 1600.0;
+// JPEG fallback quality. Frame rate, dimensions, H.264 bitrate, and keyframe
+// interval are negotiated per stream through IOSPYStreamConfig.
 static const CGFloat kQuality = 0.72;
-static const NSTimeInterval kInterval = 1.0 / 45.0;
+
+static double streamNowMs(void) {
+    return CFAbsoluteTimeGetCurrent() * 1000.0;
+}
 
 // clipboard sync bookkeeping (must hash byte-identically to the host)
 static uint64_t gLastSyncedHash = 0;
@@ -41,6 +42,8 @@ static uint64_t clipHash(NSString *t) {
 - (void)checkClipboard;
 - (void)applyRemoteClipboard:(NSString *)text paste:(BOOL)paste;
 - (void)sendClipboardChanged:(NSString *)text;
+- (void)resetStreamStats;
+- (void)emitStatsIfNeeded;
 @end
 
 @implementation IOSPYStreamClient {
@@ -52,6 +55,18 @@ static uint64_t clipHash(NSString *t) {
     IOSPYH264Encoder *_encoder;    // created lazily on the capture queue
     uint8_t _codec;                // 0 = MJPEG, 1 = H.264 (host's request)
     BOOL _needKeyframe;            // force an H.264 keyframe on the next frame
+    IOSPYStreamConfig _config;
+
+    double _streamStartMs;
+    double _lastStatsMs;
+    uint64_t _captureTicks;
+    uint64_t _capturedFrames;
+    uint64_t _encodedFrames;
+    uint64_t _sentFrames;
+    uint64_t _droppedFrames;
+    double _captureMsTotal;
+    double _encodeMsTotal;
+    double _sendMsTotal;
 }
 
 + (instancetype)shared {
@@ -66,6 +81,8 @@ static uint64_t clipHash(NSString *t) {
 - (instancetype)init {
     if ((self = [super init])) {
         _fd = -1;
+        _config = IOSPYParseStreamConfig(nil);
+        _codec = _config.codec;
         _captureQueue = dispatch_queue_create("com.ioscpy.capture", DISPATCH_QUEUE_SERIAL);
         _clipQueue = dispatch_queue_create("com.ioscpy.clip", DISPATCH_QUEUE_SERIAL);
         [self startClipboardObserver];
@@ -204,12 +221,13 @@ static uint64_t clipHash(NSString *t) {
             continue;
         }
         if (header.type == IOSPYMsgStartStream) {
-            // The start command carries the codec the host wants (0/empty = MJPEG,
-            // 1 = H.264). Force a keyframe so a freshly connected host can decode.
-            uint8_t codec = (payload.length >= 1) ? ((const uint8_t *)payload.bytes)[0] : 0;
+            IOSPYStreamConfig config = IOSPYParseStreamConfig(payload);
             dispatch_async(_captureQueue, ^{
-                self->_codec = codec;
+                [self stopCapture];
+                self->_config = config;
+                self->_codec = config.codec;
                 self->_needKeyframe = YES;
+                [self resetStreamStats];
                 [self startCapture];
             });
         } else if (header.type == IOSPYMsgStopStream) {
@@ -274,12 +292,15 @@ static uint64_t clipHash(NSString *t) {
         return;
     }
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _captureQueue);
-    uint64_t interval = (uint64_t)(kInterval * NSEC_PER_SEC);
+    uint16_t fps = MAX(_config.target_fps, 1);
+    uint64_t interval = NSEC_PER_SEC / fps;
     dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, interval, interval / 4);
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_timer, ^{ [weakSelf captureAndSend]; });
     dispatch_resume(_timer);
-    NSLog(@"[ioscpyhook] capture started");
+    NSLog(@"[ioscpyhook] capture started codec=%u fps=%u max=%u bitrate=%u mode=%u",
+          _config.codec, fps, _config.max_dimension, _config.bitrate_bps,
+          _config.latency_mode);
 }
 
 - (void)stopCapture {
@@ -292,25 +313,76 @@ static uint64_t clipHash(NSString *t) {
     [_encoder invalidate];
 }
 
+- (void)resetStreamStats {
+    _streamStartMs = streamNowMs();
+    _lastStatsMs = _streamStartMs;
+    _captureTicks = 0;
+    _capturedFrames = 0;
+    _encodedFrames = 0;
+    _sentFrames = 0;
+    _droppedFrames = 0;
+    _captureMsTotal = 0;
+    _encodeMsTotal = 0;
+    _sendMsTotal = 0;
+}
+
+- (void)emitStatsIfNeeded {
+    double now = streamNowMs();
+    if (_fd < 0 || now - _lastStatsMs < 1000.0) {
+        return;
+    }
+    NSDictionary *stats = @{
+        @"uptime_ms": @((uint64_t)MAX(now - _streamStartMs, 0)),
+        @"requested_fps": @(_config.target_fps),
+        @"max_dimension": @(_config.max_dimension),
+        @"bitrate_bps": @(_config.bitrate_bps),
+        @"capture_ticks": @(_captureTicks),
+        @"captured_frames": @(_capturedFrames),
+        @"encoded_frames": @(_encodedFrames),
+        @"sent_frames": @(_sentFrames),
+        @"dropped_frames": @(_droppedFrames),
+        @"capture_ms_avg": @(_capturedFrames ? _captureMsTotal / _capturedFrames : 0),
+        @"encode_ms_avg": @(_encodedFrames ? _encodeMsTotal / _encodedFrames : 0),
+        @"send_ms_avg": @(_sentFrames ? _sendMsTotal / _sentFrames : 0),
+    };
+    NSData *body = [NSJSONSerialization dataWithJSONObject:stats options:0 error:nil];
+    if (body) {
+        IOSPYTryWriteFrame(_fd, IOSPYMsgStats, IOSPY_CHANNEL_CONTROL, 0, body);
+    }
+    _lastStatsMs = now;
+    _captureTicks = 0;
+    _capturedFrames = 0;
+    _encodedFrames = 0;
+    _sentFrames = 0;
+    _droppedFrames = 0;
+    _captureMsTotal = 0;
+    _encodeMsTotal = 0;
+    _sendMsTotal = 0;
+}
+
 - (void)captureAndSend {
     int fd = _fd;
     if (fd < 0) {
         return;
     }
+    _captureTicks++;
+    BOOL handled = NO;
     if (_codec == IOSPY_VIDEO_CODEC_H264) {
         if ([self captureAndSendH264:fd]) {
-            return;
+            handled = YES;
+        } else {
+            // H.264 isn't usable on this device/OS, so drop to MJPEG for the rest
+            // of the session and keep the screen alive.
+            [_encoder invalidate];
+            _encoder = nil;
+            _codec = IOSPY_VIDEO_CODEC_MJPEG;
+            NSLog(@"[ioscpyhook] H.264 unavailable; using MJPEG");
         }
-        // H.264 isn't usable on this device/OS, so drop to MJPEG for the rest of
-        // the session and the screen still shows. The host follows the per-frame
-        // flags, so it adapts on its own. Tear the encoder down (and force a fresh
-        // one if H.264 is requested again) so a half-failed session isn't reused.
-        [_encoder invalidate];
-        _encoder = nil;
-        _codec = IOSPY_VIDEO_CODEC_MJPEG;
-        NSLog(@"[ioscpyhook] H.264 unavailable; using MJPEG");
     }
-    [self captureAndSendJPEG:fd];
+    if (!handled) {
+        [self captureAndSendJPEG:fd];
+    }
+    [self emitStatsIfNeeded];
 }
 
 // Current capture orientation packed into the VIDEO_FRAME flag bits, so the host
@@ -338,12 +410,27 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
 
 - (void)captureAndSendJPEG:(int)fd {
     int width = 0, height = 0;
-    NSData *jpeg = IOSPYCaptureScreenJPEG(kMaxDimension, kQuality, &width, &height, NULL, NULL);
+    double captureMs = 0, encodeMs = 0;
+    NSData *jpeg = IOSPYCaptureScreenJPEG(_config.max_dimension, kQuality, &width, &height,
+                                          &captureMs, &encodeMs);
     if (!jpeg) {
+        _droppedFrames++;
         return;
     }
-    IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,
-                    makeVideoFrame(width, height, orientationFlags(), jpeg));
+    _capturedFrames++;
+    _encodedFrames++;
+    _captureMsTotal += captureMs;
+    _encodeMsTotal += encodeMs;
+
+    double sendStart = streamNowMs();
+    BOOL sent = IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,
+                                makeVideoFrame(width, height, orientationFlags(), jpeg));
+    _sendMsTotal += streamNowMs() - sendStart;
+    if (sent) {
+        _sentFrames++;
+    } else {
+        _droppedFrames++;
+    }
 }
 
 - (BOOL)captureAndSendH264:(int)fd {
@@ -354,27 +441,37 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
         _encoder = [[IOSPYH264Encoder alloc] init];
     }
     int width = 0, height = 0;
-    IOSurfaceRef surface = IOSPYCaptureScreenSurface(kMaxDimension, &width, &height);
+    double captureStart = streamNowMs();
+    IOSurfaceRef surface = IOSPYCaptureScreenSurface(_config.max_dimension, &width, &height);
+    double captureMs = streamNowMs() - captureStart;
     if (!surface || width < 2 || height < 2) {
+        _droppedFrames++;
         return NO;
     }
-    int fps = (int)round(1.0 / kInterval);
-    if (fps < 1) {
-        fps = 1;
-    }
+    _capturedFrames++;
+    _captureMsTotal += captureMs;
+    int fps = MAX(_config.target_fps, 1);
     BOOL isKey = NO;
+    double encodeStart = streamNowMs();
     NSData *avcc = [_encoder encodeSurface:surface
                                      width:width
                                     height:height
                                        fps:fps
+                                   bitrate:_config.bitrate_bps
+                          keyframeInterval:MAX(_config.keyframe_interval_frames, 1)
                              forceKeyframe:_needKeyframe
                                   keyframe:&isKey];
+    double encodeMs = streamNowMs() - encodeStart;
     if (!avcc) {
+        _droppedFrames++;
         return NO; // hard failure, fall back to MJPEG
     }
     if (avcc.length == 0) {
+        _droppedFrames++;
         return YES; // dropped this tick, encoder still healthy
     }
+    _encodedFrames++;
+    _encodeMsTotal += encodeMs;
     if (isKey) {
         _needKeyframe = NO;
     }
@@ -382,8 +479,15 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     if (isKey) {
         flags |= IOSPY_VIDEO_FLAG_KEYFRAME | IOSPY_VIDEO_FLAG_CONFIG;
     }
-    IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,
-                    makeVideoFrame(width, height, flags, avcc));
+    double sendStart = streamNowMs();
+    BOOL sent = IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,
+                                makeVideoFrame(width, height, flags, avcc));
+    _sendMsTotal += streamNowMs() - sendStart;
+    if (sent) {
+        _sentFrames++;
+    } else {
+        _droppedFrames++;
+    }
     return YES;
 }
 

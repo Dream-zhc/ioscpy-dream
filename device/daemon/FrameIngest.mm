@@ -150,9 +150,9 @@
                     // MJPEG: keep only the latest frame, the pump drops stale ones.
                     [[IOSPYFrameStore shared] setPayload:payload];
                 }
-            } else if (header.type == IOSPYMsgClipboardChanged) {
-                // Relay tweak->host (e.g. device clipboard changed) on the host's
-                // control socket, serialized with the video pump's writes.
+            } else if (header.type == IOSPYMsgClipboardChanged || header.type == IOSPYMsgStats) {
+                // Relay tweak->host control events and periodic telemetry on the
+                // host socket, serialized with the video pump's writes.
                 int hostFd;
                 NSLock *hostLock;
                 @synchronized(self) {
@@ -161,10 +161,10 @@
                 }
                 if (hostFd >= 0 && hostLock) {
                     [hostLock lock];
-                    // Non-blocking: a clipboard frame is best-effort, not worth
-                    // stalling the ingest thread (and the tweak behind it) over.
-                    IOSPYTryWriteFrame(hostFd, IOSPYMsgClipboardChanged, IOSPY_CHANNEL_CONTROL, 0,
-                                       payload);
+                    // Non-blocking: clipboard and telemetry are best-effort and
+                    // must never stall the tweak's capture path.
+                    IOSPYTryWriteFrame(hostFd, (IOSPYMessageType)header.type,
+                                       IOSPY_CHANNEL_CONTROL, 0, payload);
                     [hostLock unlock];
                 }
             }
@@ -179,11 +179,11 @@
     return connected;
 }
 
-- (void)tellTweakStartCodec:(uint8_t)codec {
+- (void)tellTweakStartPayload:(NSData *)payload {
     [_writeLock lock];
     if (_tweakFd >= 0) {
-        NSData *p = [NSData dataWithBytes:&codec length:1];
-        IOSPYWriteFrame(_tweakFd, IOSPYMsgStartStream, IOSPY_CHANNEL_CONTROL, 0, p);
+        IOSPYWriteFrame(_tweakFd, IOSPYMsgStartStream, IOSPY_CHANNEL_CONTROL, 0,
+                        payload ?: [NSData data]);
     }
     [_writeLock unlock];
 }

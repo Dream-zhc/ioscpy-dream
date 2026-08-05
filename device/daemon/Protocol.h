@@ -29,6 +29,27 @@
 #define IOSPY_VIDEO_CODEC_MJPEG   0
 #define IOSPY_VIDEO_CODEC_H264    1
 
+// Extended START_STREAM payload. Byte zero remains the codec selector so an old
+// daemon can safely ignore the remaining tuning fields.
+#define IOSPY_STREAM_CONFIG_VERSION 1
+#define IOSPY_STREAM_CONFIG_SIZE    16
+
+typedef NS_ENUM(uint8_t, IOSPYLatencyMode) {
+    IOSPYLatencyQuality = 0,
+    IOSPYLatencyBalanced = 1,
+    IOSPYLatencyLow = 2,
+    IOSPYLatencyHighRefresh = 3,
+};
+
+typedef struct {
+    uint8_t codec;
+    uint16_t target_fps;
+    uint16_t max_dimension;
+    uint8_t latency_mode;
+    uint32_t bitrate_bps;
+    uint16_t keyframe_interval_frames;
+} IOSPYStreamConfig;
+
 typedef NS_ENUM(uint16_t, IOSPYMessageType) {
     IOSPYMsgHello                = 1,
     IOSPYMsgHelloAck             = 2,
@@ -53,6 +74,7 @@ typedef NS_ENUM(uint16_t, IOSPYMessageType) {
     IOSPYMsgPong                 = 61,
     IOSPYMsgError                = 70,
     IOSPYMsgLog                  = 71,
+    IOSPYMsgStats                = 72,
 };
 
 typedef struct {
@@ -74,6 +96,10 @@ BOOL IOSPYReadFrame(int fd, IOSPYFrameHeader *header, NSData **payload);
 
 // Write one full frame. Returns NO if the socket write fails.
 BOOL IOSPYWriteFrame(int fd, IOSPYMessageType type, uint64_t streamId, uint64_t seq, NSData *payload);
+
+// Decode a START_STREAM payload, applying safe defaults for the original
+// empty/one-byte form and clamping untrusted host values.
+IOSPYStreamConfig IOSPYParseStreamConfig(NSData *payload);
 
 // Try to write one frame without blocking. Returns 1 if fully sent, 0 if the
 // send buffer was full so the frame is skipped (nothing left half-written), or

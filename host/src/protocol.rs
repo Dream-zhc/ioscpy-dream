@@ -33,6 +33,87 @@ pub const VIDEO_FLAG_CONFIG: u32 = 0x4;
 pub const VIDEO_CODEC_MJPEG: u8 = 0;
 pub const VIDEO_CODEC_H264: u8 = 1;
 
+/// Versioned START_STREAM payload. Older daemons only inspect byte zero, so the
+/// extended fields remain backward-compatible with the original codec byte.
+pub const STREAM_CONFIG_VERSION: u8 = 1;
+pub const STREAM_CONFIG_SIZE: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum LatencyMode {
+    Quality = 0,
+    Balanced = 1,
+    LowLatency = 2,
+    HighRefresh = 3,
+}
+
+impl LatencyMode {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Quality,
+            2 => Self::LowLatency,
+            3 => Self::HighRefresh,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamConfig {
+    pub codec: u8,
+    pub target_fps: u16,
+    pub max_dimension: u16,
+    pub latency_mode: LatencyMode,
+    pub bitrate_bps: u32,
+    pub keyframe_interval_frames: u16,
+}
+
+impl StreamConfig {
+    pub fn legacy(codec: u8) -> Self {
+        Self {
+            codec,
+            target_fps: 45,
+            max_dimension: 1600,
+            latency_mode: LatencyMode::Balanced,
+            bitrate_bps: 8_000_000,
+            keyframe_interval_frames: 180,
+        }
+    }
+
+    pub fn encode(self) -> [u8; STREAM_CONFIG_SIZE] {
+        let mut payload = [0u8; STREAM_CONFIG_SIZE];
+        payload[0] = self.codec;
+        payload[1] = STREAM_CONFIG_VERSION;
+        payload[2..4].copy_from_slice(&self.target_fps.to_be_bytes());
+        payload[4..6].copy_from_slice(&self.max_dimension.to_be_bytes());
+        payload[6] = self.latency_mode as u8;
+        payload[8..12].copy_from_slice(&self.bitrate_bps.to_be_bytes());
+        payload[12..14].copy_from_slice(&self.keyframe_interval_frames.to_be_bytes());
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Self {
+        let codec = payload.first().copied().unwrap_or(VIDEO_CODEC_MJPEG);
+        if payload.len() < STREAM_CONFIG_SIZE || payload[1] != STREAM_CONFIG_VERSION {
+            return Self::legacy(codec);
+        }
+        let target_fps = u16::from_be_bytes([payload[2], payload[3]]).clamp(1, 240);
+        let max_dimension = u16::from_be_bytes([payload[4], payload[5]]).clamp(320, 4096);
+        let bitrate_bps =
+            u32::from_be_bytes(payload[8..12].try_into().unwrap()).clamp(500_000, 100_000_000);
+        let keyframe_interval_frames =
+            u16::from_be_bytes([payload[12], payload[13]]).clamp(1, 60_000);
+        Self {
+            codec,
+            target_fps,
+            max_dimension,
+            latency_mode: LatencyMode::from_u8(payload[6]),
+            bitrate_bps,
+            keyframe_interval_frames,
+        }
+    }
+}
+
 // Capture orientation packed into VIDEO_FRAME flags bits 3-4 (value =
 // orientation - 1). The frame is always the device's portrait framebuffer.
 pub const VIDEO_ORIENT_SHIFT: u32 = 3;
@@ -71,6 +152,7 @@ pub enum MessageType {
     Pong = 61,
     Error = 70,
     Log = 71,
+    Stats = 72,
 }
 
 impl MessageType {
@@ -100,6 +182,7 @@ impl MessageType {
             61 => Pong,
             70 => Error,
             71 => Log,
+            72 => Stats,
             _ => return None,
         })
     }
@@ -374,6 +457,36 @@ pub struct LogMessage {
     pub message: String,
 }
 
+/// Periodic device-side stream counters. Values describe the most recent
+/// reporting window except `uptime_ms`, which is monotonic for the stream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceStreamStats {
+    #[serde(default)]
+    pub uptime_ms: u64,
+    #[serde(default)]
+    pub requested_fps: u16,
+    #[serde(default)]
+    pub max_dimension: u16,
+    #[serde(default)]
+    pub bitrate_bps: u32,
+    #[serde(default)]
+    pub capture_ticks: u64,
+    #[serde(default)]
+    pub captured_frames: u64,
+    #[serde(default)]
+    pub encoded_frames: u64,
+    #[serde(default)]
+    pub sent_frames: u64,
+    #[serde(default)]
+    pub dropped_frames: u64,
+    #[serde(default)]
+    pub capture_ms_avg: f64,
+    #[serde(default)]
+    pub encode_ms_avg: f64,
+    #[serde(default)]
+    pub send_ms_avg: f64,
+}
+
 fn default_level() -> String {
     "info".to_string()
 }
@@ -506,10 +619,31 @@ mod tests {
 
     #[test]
     fn message_type_roundtrip() {
-        for v in [1u16, 2, 5, 12, 13, 50, 60, 61, 70, 71] {
+        for v in [1u16, 2, 5, 12, 13, 50, 60, 61, 70, 71, 72] {
             let mt = MessageType::from_u16(v).unwrap();
             assert_eq!(mt as u16, v);
         }
         assert!(MessageType::from_u16(9999).is_none());
+    }
+
+    #[test]
+    fn stream_config_roundtrip() {
+        let config = StreamConfig {
+            codec: VIDEO_CODEC_H264,
+            target_fps: 90,
+            max_dimension: 1280,
+            latency_mode: LatencyMode::HighRefresh,
+            bitrate_bps: 12_000_000,
+            keyframe_interval_frames: 180,
+        };
+        assert_eq!(StreamConfig::decode(&config.encode()), config);
+    }
+
+    #[test]
+    fn stream_config_accepts_legacy_codec_byte() {
+        assert_eq!(
+            StreamConfig::decode(&[VIDEO_CODEC_H264]),
+            StreamConfig::legacy(VIDEO_CODEC_H264)
+        );
     }
 }

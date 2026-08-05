@@ -14,8 +14,9 @@
 // Whether a tweak is currently connected and able to stream.
 - (BOOL)tweakConnected;
 
-// Tell the tweak to begin capturing with a codec (0 = MJPEG, 1 = H.264) / stop.
-- (void)tellTweakStartCodec:(uint8_t)codec;
+// Tell the tweak to begin capturing with the versioned START_STREAM payload.
+// Byte zero remains the codec selector for compatibility.
+- (void)tellTweakStartPayload:(NSData *)payload;
 - (void)tellTweakStop;
 
 // Choose how incoming video frames reach the host. MJPEG (NO) keeps only the

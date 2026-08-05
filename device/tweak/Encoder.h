@@ -37,6 +37,8 @@ BOOL IOSPYH264Available(void);
                     width:(int)width
                    height:(int)height
                       fps:(int)fps
+                  bitrate:(uint32_t)bitrate
+         keyframeInterval:(int)keyframeInterval
             forceKeyframe:(BOOL)forceKeyframe
                  keyframe:(BOOL *)outKeyframe;
 

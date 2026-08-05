@@ -33,10 +33,88 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, StreamProfile};
 
 const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Serialize)]
+struct BenchReport {
+    elapsed_seconds: f64,
+    codec: String,
+    width: u32,
+    height: u32,
+    received_frames: u64,
+    decoded_frames: u64,
+    keyframes: u64,
+    received_fps: f64,
+    bytes: u64,
+    average_kilobytes_per_frame: f64,
+    megabytes_per_second: f64,
+    read_milliseconds_per_frame: f64,
+    decode_milliseconds_per_frame: f64,
+    stream_config: protocol::StreamConfig,
+    device: Option<protocol::DeviceStreamStats>,
+}
+
+fn stream_config(cli: &Cli, codec: u8) -> protocol::StreamConfig {
+    use protocol::{LatencyMode, StreamConfig};
+
+    let mut config = match cli.profile.unwrap_or(StreamProfile::Legacy) {
+        StreamProfile::Legacy => StreamConfig::legacy(codec),
+        StreamProfile::Quality => StreamConfig {
+            codec,
+            target_fps: 60,
+            max_dimension: 1600,
+            latency_mode: LatencyMode::Quality,
+            bitrate_bps: 12_000_000,
+            keyframe_interval_frames: 240,
+        },
+        StreamProfile::Balanced => StreamConfig {
+            codec,
+            target_fps: 60,
+            max_dimension: 1440,
+            latency_mode: LatencyMode::Balanced,
+            bitrate_bps: 8_000_000,
+            keyframe_interval_frames: 240,
+        },
+        StreamProfile::Latency => StreamConfig {
+            codec,
+            target_fps: 60,
+            max_dimension: 1280,
+            latency_mode: LatencyMode::LowLatency,
+            bitrate_bps: 6_000_000,
+            keyframe_interval_frames: 120,
+        },
+        StreamProfile::HighRefresh => StreamConfig {
+            codec,
+            target_fps: 90,
+            max_dimension: 1280,
+            latency_mode: LatencyMode::HighRefresh,
+            bitrate_bps: 10_000_000,
+            keyframe_interval_frames: 180,
+        },
+    };
+
+    if let Some(fps) = cli.fps {
+        config.target_fps = fps;
+    }
+    if let Some(max_dimension) = cli.max_dimension {
+        config.max_dimension = max_dimension;
+    }
+    if let Some(mbps) = cli.bitrate_mbps {
+        config.bitrate_bps = mbps.saturating_mul(1_000_000);
+    }
+    let keyframe_seconds = cli.keyframe_seconds.unwrap_or_else(|| {
+        (u32::from(config.keyframe_interval_frames) / u32::from(config.target_fps.max(1))).max(1)
+            as u16
+    });
+    config.keyframe_interval_frames = u32::from(config.target_fps)
+        .saturating_mul(u32::from(keyframe_seconds))
+        .min(u32::from(u16::MAX)) as u16;
+    config
+}
 
 fn main() {
     let cli = Cli::parse_args();
@@ -249,6 +327,16 @@ fn run_connection_loop(
         } else {
             protocol::VIDEO_CODEC_MJPEG
         };
+        let stream_config = stream_config(cli, codec);
+        debug!(
+            "stream config: codec={} fps={} max={} bitrate={} keyint={} mode={:?}",
+            stream_config.codec,
+            stream_config.target_fps,
+            stream_config.max_dimension,
+            stream_config.bitrate_bps,
+            stream_config.keyframe_interval_frames,
+            stream_config.latency_mode,
+        );
 
         // Only hide the device keyboard if asked and the tweak can do it.
         let suppress_keyboard = cli.no_keyboard && ack.capabilities.keyboard;
@@ -259,7 +347,7 @@ fn run_connection_loop(
             frame_sink.clone(),
             input_rx.as_ref(),
             clip_in.as_ref(),
-            codec,
+            stream_config,
             suppress_keyboard,
         )? {
             health::SessionEnd::Quit => break,
@@ -290,12 +378,13 @@ fn cmd_snapshot(cli: &Cli, port: u16, path: &str) -> Result<()> {
         warn!("the phone side isn't fully up yet, so the screen might not show. Respring the phone (or reinstall ioscpy from Sileo) and reconnect.");
     }
 
+    let snapshot_config = stream_config(cli, protocol::VIDEO_CODEC_MJPEG).encode();
     protocol::write_frame(
         &mut stream,
         protocol::MessageType::StartStream,
         protocol::CHANNEL_CONTROL,
         0,
-        &[],
+        &snapshot_config,
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -339,20 +428,26 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     } else {
         protocol::VIDEO_CODEC_MJPEG
     };
+    let bench_config = stream_config(cli, codec);
     println!(
-        "bench: requesting {} stream",
+        "bench: requesting {} stream, {} fps, max {}, {:.1} Mbps, {:?}",
         if codec == protocol::VIDEO_CODEC_H264 {
             "h264"
         } else {
             "mjpeg"
-        }
+        },
+        bench_config.target_fps,
+        bench_config.max_dimension,
+        bench_config.bitrate_bps as f64 / 1_000_000.0,
+        bench_config.latency_mode,
     );
+    let start_payload = bench_config.encode();
     protocol::write_frame(
         &mut stream,
         protocol::MessageType::StartStream,
         protocol::CHANNEL_CONTROL,
         0,
-        &[codec],
+        &start_payload,
     )?;
     // Ask for a keyframe so H.264 decodes from the first frame.
     let _ = protocol::write_frame(
@@ -371,6 +466,7 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     let mut read_total = Duration::ZERO;
     let (mut w, mut h) = (0u32, 0u32);
     let mut h264_dec: Option<h264::H264Decoder> = None;
+    let mut last_device_stats: Option<protocol::DeviceStreamStats> = None;
 
     while start.elapsed() < window {
         let rt = Instant::now();
@@ -408,6 +504,11 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
                     }
                 }
             }
+        } else if frame.message_type() == Some(protocol::MessageType::Stats) {
+            if let Ok(stats) = serde_json::from_slice::<protocol::DeviceStreamStats>(&frame.payload)
+            {
+                last_device_stats = Some(stats);
+            }
         }
     }
     let _ = protocol::write_frame(
@@ -421,6 +522,27 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     let elapsed = start.elapsed().as_secs_f64();
     let n = frames.max(1) as f64;
     let kind = if h264_frames > 0 { "h264" } else { "mjpeg" };
+    let report = BenchReport {
+        elapsed_seconds: elapsed,
+        codec: kind.to_string(),
+        width: w,
+        height: h,
+        received_frames: frames,
+        decoded_frames: decoded,
+        keyframes,
+        received_fps: frames as f64 / elapsed.max(f64::EPSILON),
+        bytes,
+        average_kilobytes_per_frame: bytes as f64 / n / 1024.0,
+        megabytes_per_second: bytes as f64 / elapsed.max(f64::EPSILON) / 1024.0 / 1024.0,
+        read_milliseconds_per_frame: read_total.as_secs_f64() * 1000.0 / n,
+        decode_milliseconds_per_frame: if decoded > 0 {
+            decode_total.as_secs_f64() * 1000.0 / decoded as f64
+        } else {
+            0.0
+        },
+        stream_config: bench_config,
+        device: last_device_stats,
+    };
     println!(
         "bench: {frames} {kind} frames in {elapsed:.1}s = {:.1} fps",
         frames as f64 / elapsed
@@ -440,6 +562,16 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
             decode_total.as_secs_f64() * 1000.0 / decoded as f64
         );
     }
+    if let Some(path) = cli.bench_json.as_deref() {
+        let json = serde_json::to_string_pretty(&report)?;
+        if path == "-" {
+            println!("{json}");
+        } else {
+            std::fs::write(path, json)
+                .with_context(|| format!("could not write benchmark JSON to {path}"))?;
+            println!("  benchmark JSON: {path}");
+        }
+    }
     Ok(())
 }
 
@@ -453,12 +585,13 @@ fn cmd_action(cli: &Cli, port: u16, code: u16) -> Result<()> {
 
     let ack = protocol::handshake(&mut stream, HOST_VERSION).context("handshake failed")?;
     println!("input backends: {:?}", ack.capabilities.input_backends);
+    let action_config = stream_config(cli, protocol::VIDEO_CODEC_MJPEG).encode();
     protocol::write_frame(
         &mut stream,
         protocol::MessageType::StartStream,
         protocol::CHANNEL_CONTROL,
         0,
-        &[],
+        &action_config,
     )?;
 
     // Warm up: count frames for about 2s.
