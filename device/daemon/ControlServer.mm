@@ -13,7 +13,7 @@
 #import <unistd.h>
 #import <errno.h>
 
-NSString *const IOSPYDaemonVersion = @"0.2.0-dream.1";
+NSString *const IOSPYDaemonVersion = @"0.2.0-dream.2";
 
 @implementation IOSPYControlServer {
     uint16_t _port;

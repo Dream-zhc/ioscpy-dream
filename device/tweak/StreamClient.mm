@@ -64,6 +64,7 @@ static uint64_t clipHash(NSString *t) {
     uint16_t _effectiveMaxDimension;
     uint32_t _effectiveBitrate;
     NSUInteger _healthyStatsWindows;
+    NSUInteger _pressureStatsWindows;
 
     double _streamStartMs;
     double _lastStatsMs;
@@ -344,6 +345,7 @@ static uint64_t clipHash(NSString *t) {
     _effectiveMaxDimension = _config.max_dimension;
     _effectiveBitrate = _config.bitrate_bps;
     _healthyStatsWindows = 0;
+    _pressureStatsWindows = 0;
 }
 
 - (void)emitStatsIfNeeded {
@@ -358,27 +360,37 @@ static uint64_t clipHash(NSString *t) {
     double dropRatio = _captureTicks ? (double)_droppedFrames / _captureTicks : 0;
 
     // High-refresh and explicit low-latency modes trade resolution for freshness.
-    // React slowly enough to avoid oscillation, but cut promptly when queues or
-    // processing time exceed the frame budget.
+    // Capture and VideoToolbox encode are pipelined, so summing their average
+    // durations incorrectly treats healthy 120 FPS operation as overloaded. Use
+    // the slower stage plus actual queue/drop signals, and require two pressured
+    // windows before reducing resolution to avoid one-second oscillations.
     if (_config.latency_mode >= IOSPYLatencyLow) {
-        BOOL pressured = dropRatio > 0.12 || captureAvg + encodeAvg > frameBudget * 0.85 ||
+        double slowestStage = MAX(captureAvg, encodeAvg);
+        BOOL pressured = dropRatio > 0.08 || slowestStage > frameBudget * 1.10 ||
                          _h264InFlight >= 2 || _sendBacklog >= 2;
-        if (pressured && _effectiveMaxDimension > 640) {
+        if (pressured) {
+            _pressureStatsWindows++;
+            _healthyStatsWindows = 0;
+        } else {
+            _pressureStatsWindows = 0;
+        }
+
+        if (_pressureStatsWindows >= 2 && _effectiveMaxDimension > 640) {
             uint16_t next = MAX((uint16_t)640,
                                 (uint16_t)((double)_effectiveMaxDimension * 0.90));
             next &= ~1u;
             _effectiveMaxDimension = next;
             _healthyStatsWindows = 0;
-        } else if (!pressured && dropRatio < 0.02 &&
-                   captureAvg + encodeAvg < frameBudget * 0.60) {
+            _pressureStatsWindows = 0;
+        } else if (!pressured && dropRatio < 0.02 && slowestStage < frameBudget * 0.80) {
             _healthyStatsWindows++;
-            if (_healthyStatsWindows >= 3 && _effectiveMaxDimension < _config.max_dimension) {
+            if (_healthyStatsWindows >= 2 && _effectiveMaxDimension < _config.max_dimension) {
                 uint16_t next = MIN(_config.max_dimension,
-                                    (uint16_t)((double)_effectiveMaxDimension * 1.05));
+                                    (uint16_t)((double)_effectiveMaxDimension * 1.08));
                 _effectiveMaxDimension = next & ~1u;
                 _healthyStatsWindows = 0;
             }
-        } else {
+        } else if (!pressured) {
             _healthyStatsWindows = 0;
         }
 
@@ -402,6 +414,7 @@ static uint64_t clipHash(NSString *t) {
         @"capture_ms_avg": @(captureAvg),
         @"encode_ms_avg": @(encodeAvg),
         @"send_ms_avg": @(sendAvg),
+        @"input": IOSPYInputDiagnostics() ?: @{},
     };
     NSData *body = [NSJSONSerialization dataWithJSONObject:stats options:0 error:nil];
     if (body) {

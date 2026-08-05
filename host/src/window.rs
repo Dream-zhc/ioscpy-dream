@@ -689,6 +689,7 @@ pub fn run_window(
     input_tx: Sender<InputFrame>,
     clip_in: Receiver<String>,
     target_fps: u16,
+    input_debug: bool,
 ) -> Result<()> {
     let first = match wait_for_first_frame(&frames, &stop) {
         Some(f) => f,
@@ -752,6 +753,7 @@ pub fn run_window(
             win_h: gh,
             tx: &input_tx,
             clip: &clip,
+            input_debug,
         };
         pump_input(&window, &current, &mut input, &input_ctx);
         #[cfg(not(target_os = "macos"))]
@@ -815,6 +817,7 @@ struct InputCtx<'a> {
     win_h: usize,
     tx: &'a Sender<InputFrame>,
     clip: &'a Arc<Mutex<ClipState>>,
+    input_debug: bool,
 }
 
 /// Turn this frame's mouse state into touch messages, or, for a press that
@@ -829,6 +832,12 @@ fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx
             // the cursor is now outside the window (a fast swipe can release out
             // there). Skip this and a phantom finger stays down on the device,
             // which then ignores every later touch until something resets it.
+            if ctx.input_debug {
+                eprintln!(
+                    "ioscpy: input host up x={:.4} y={:.4}",
+                    state.last.0, state.last.1
+                );
+            }
             send_touch(ctx.tx, TouchPhase::Up, state.last.0, state.last.1);
             state.touching = false;
         }
@@ -875,6 +884,9 @@ fn handle_fresh_press(
     let (mx, my) = pos;
     if (mx as usize) < ctx.content_w {
         let (nx, ny) = map_to_norm(mx, my, ctx.content_w, ctx.win_h, frame.width, frame.height);
+        if ctx.input_debug {
+            eprintln!("ioscpy: input host down x={nx:.4} y={ny:.4}");
+        }
         send_touch(ctx.tx, TouchPhase::Down, nx, ny);
         state.touching = true;
         state.last = (nx, ny);

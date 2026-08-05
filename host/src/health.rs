@@ -69,6 +69,7 @@ pub fn run_session(
     clip_in: Option<&Sender<String>>,
     stream_config: protocol::StreamConfig,
     suppress_keyboard: bool,
+    input_debug: bool,
 ) -> Result<SessionEnd> {
     stream.set_read_timeout(None).ok();
     let mut writer = stream.try_clone().context("clone control stream")?;
@@ -181,6 +182,10 @@ pub fn run_session(
     let mut last_keyframe_req = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
+    let mut input_sent = 0u64;
+    let mut touch_sent = 0u64;
+    let mut last_input_report = 0u64;
+    let mut input_report_window = Instant::now();
 
     let outcome = loop {
         if stop.load(Ordering::Relaxed) {
@@ -234,6 +239,7 @@ pub fn run_session(
         if let Some(rx_in) = input_rx {
             let mut failed = false;
             while let Ok(frame) = rx_in.try_recv() {
+                let is_touch = frame.msg_type == MessageType::InputTouch;
                 if protocol::write_frame(
                     &mut writer,
                     frame.msg_type,
@@ -247,17 +253,29 @@ pub fn run_session(
                     break;
                 }
                 seq += 1;
+                input_sent += 1;
+                if is_touch {
+                    touch_sent += 1;
+                }
             }
             if failed {
                 break SessionEnd::Lost;
             }
         }
 
+        if input_report_window.elapsed() >= Duration::from_secs(1) {
+            if input_sent != last_input_report {
+                crate::debug!("input: host sent {input_sent} events ({touch_sent} touch)");
+                last_input_report = input_sent;
+            }
+            input_report_window = Instant::now();
+        }
+
         match rx.recv_timeout(Duration::from_millis(16)) {
             Ok(Incoming::Frame(frame)) => match frame.message_type() {
                 Some(MessageType::Pong) => last_pong = Instant::now(),
                 Some(MessageType::Log) => print_log(&frame.payload),
-                Some(MessageType::Stats) => print_stats(&frame.payload),
+                Some(MessageType::Stats) => print_stats(&frame.payload, input_debug),
                 Some(MessageType::Error) => print_error(&frame.payload),
                 Some(MessageType::ClipboardChanged) => {
                     // [flags:u8][utf8]; hand the text to the window thread, which
@@ -304,7 +322,7 @@ fn print_log(payload: &[u8]) {
     }
 }
 
-fn print_stats(payload: &[u8]) {
+fn print_stats(payload: &[u8], input_debug: bool) {
     if let Ok(stats) = serde_json::from_slice::<protocol::DeviceStreamStats>(payload) {
         crate::debug!(
             "device stream: {}/{} captured, {} encoded, {} sent, {} dropped; capture {:.2} ms, encode {:.2} ms, send {:.2} ms",
@@ -317,6 +335,41 @@ fn print_stats(payload: &[u8]) {
             stats.encode_ms_avg,
             stats.send_ms_avg,
         );
+        crate::debug!(
+            "device input: route={} ready={} monitor={} sender=0x{:x}; touch={} submitted={} no-sender={} dispatched={} failures={}",
+            if stats.input.route.is_empty() {
+                "unknown"
+            } else {
+                &stats.input.route
+            },
+            stats.input.client_ready,
+            stats.input.monitor_ready,
+            stats.input.sender_id,
+            stats.input.touch_commands,
+            stats.input.touch_submitted,
+            stats.input.touch_without_sender,
+            stats.input.dispatched_events,
+            stats.input.dispatch_failures,
+        );
+        if input_debug {
+            eprintln!(
+                "ioscpy: input device route={} ready={} sender=0x{:x} commands={} submitted={} no-sender={} failures={} last=phase:{} x:{:.4} y:{:.4}",
+                if stats.input.route.is_empty() {
+                    "unknown"
+                } else {
+                    &stats.input.route
+                },
+                stats.input.client_ready,
+                stats.input.sender_id,
+                stats.input.touch_commands,
+                stats.input.touch_submitted,
+                stats.input.touch_without_sender,
+                stats.input.dispatch_failures,
+                stats.input.last_phase,
+                stats.input.last_x,
+                stats.input.last_y,
+            );
+        }
     }
 }
 

@@ -1,7 +1,11 @@
 # Rust / host
 host/target/
+host/vendor/
 **/*.rs.bk
 Cargo.lock.orig
+
+# Coding Tools execution metadata
+.baton/
 
 # Theos / device build artifacts
 device/.theos/

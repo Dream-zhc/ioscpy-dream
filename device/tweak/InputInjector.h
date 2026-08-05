@@ -14,8 +14,18 @@ typedef NS_ENUM(uint8_t, IOSPYTouchPhase) {
 extern "C" {
 #endif
 
-// Inject a single-finger touch at normalized (x, y) in [0, 1].
-void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y);
+// Inject a single-finger touch at normalized (x, y) in [0, 1]. Returns YES when
+// the event was constructed and submitted to an available HID route. This is a
+// submission acknowledgement; private IOHID APIs do not report whether the
+// foreground application ultimately consumed the event.
+BOOL IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y);
+
+// Initialize HID routing and the physical-touch sender monitor when SpringBoard
+// loads the tweak, before the first remote input arrives.
+void IOSPYInputInit(void);
+
+// Best-effort runtime diagnostics included in periodic stream telemetry.
+NSDictionary *IOSPYInputDiagnostics(void);
 
 // Trigger a system action (codes match the host: 1=Home, 2=Lock, 3=Wake,
 // 4=AppSwitcher, 5=RotateLeft, 6=RotateRight, 7=Screenshot, 8=Back).

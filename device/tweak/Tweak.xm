@@ -70,6 +70,7 @@ static BOOL gSuppressPasteAlert = NO;
         NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
         gSuppressPasteAlert = (v.majorVersion >= 16);
 
+        IOSPYInputInit();
         IOSPYOrientationStart();
         IOSPYKeyboardSuppressionInit();
         [[IOSPYStreamClient shared] start];

@@ -89,33 +89,33 @@ fn stream_config(cli: &Cli, codec: u8) -> protocol::StreamConfig {
         StreamProfile::Quality => StreamConfig {
             codec,
             target_fps: 60,
-            max_dimension: 1600,
+            max_dimension: 2160,
             latency_mode: LatencyMode::Quality,
-            bitrate_bps: 12_000_000,
-            keyframe_interval_frames: 240,
+            bitrate_bps: 25_000_000,
+            keyframe_interval_frames: 120,
         },
         StreamProfile::Balanced => StreamConfig {
             codec,
             target_fps: 60,
-            max_dimension: 1440,
+            max_dimension: 1800,
             latency_mode: LatencyMode::Balanced,
-            bitrate_bps: 8_000_000,
-            keyframe_interval_frames: 240,
+            bitrate_bps: 16_000_000,
+            keyframe_interval_frames: 120,
         },
         StreamProfile::Latency => StreamConfig {
             codec,
             target_fps: 60,
             max_dimension: 1280,
             latency_mode: LatencyMode::LowLatency,
-            bitrate_bps: 6_000_000,
+            bitrate_bps: 8_000_000,
             keyframe_interval_frames: 120,
         },
         StreamProfile::HighRefresh => StreamConfig {
             codec,
             target_fps: 90,
-            max_dimension: 1280,
+            max_dimension: 1600,
             latency_mode: LatencyMode::HighRefresh,
-            bitrate_bps: 10_000_000,
+            bitrate_bps: 18_000_000,
             keyframe_interval_frames: 180,
         },
     };
@@ -124,8 +124,13 @@ fn stream_config(cli: &Cli, codec: u8) -> protocol::StreamConfig {
         config.target_fps = fps;
     }
     if config.target_fps >= 120 && cli.max_dimension.is_none() {
-        config.max_dimension = config.max_dimension.min(1080);
-        config.bitrate_bps = config.bitrate_bps.max(12_000_000);
+        // 1080 long-edge was visibly soft on modern iPhones. A16-class devices
+        // sustain 120 capture/encode at a 1440 long edge in practice, while the
+        // adaptive controller can still step down if the actual queue/drop data
+        // shows pressure.
+        config.max_dimension = 1440;
+        config.bitrate_bps = config.bitrate_bps.max(25_000_000);
+        config.keyframe_interval_frames = 120;
         config.latency_mode = LatencyMode::HighRefresh;
     }
     if let Some(max_dimension) = cli.max_dimension {
@@ -276,6 +281,7 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
         input_tx,
         clip_in_rx,
         display_fps,
+        cli.input_debug,
     );
     stop.store(true, Ordering::Relaxed);
     let _ = net.join();
@@ -386,6 +392,7 @@ fn run_connection_loop(
             clip_in.as_ref(),
             stream_config,
             suppress_keyboard,
+            cli.input_debug,
         )? {
             health::SessionEnd::Quit => break,
             health::SessionEnd::Lost => {
@@ -767,4 +774,50 @@ fn print_debug_header(cli: &Cli) {
             .or_else(|| cli.device.clone())
             .unwrap_or_else(|| "auto (single attached device)".to_string())
     );
+}
+
+#[cfg(test)]
+mod stream_profile_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("test CLI should parse")
+    }
+
+    #[test]
+    fn balanced_profile_preserves_readable_resolution() {
+        let cli = parse(&["ioscpy", "--profile", "balanced"]);
+        let config = stream_config(&cli, protocol::VIDEO_CODEC_H264);
+        assert_eq!(config.target_fps, 60);
+        assert_eq!(config.max_dimension, 1800);
+        assert_eq!(config.bitrate_bps, 16_000_000);
+    }
+
+    #[test]
+    fn high_refresh_120_uses_new_quality_floor() {
+        let cli = parse(&["ioscpy", "--profile", "high-refresh", "--fps", "120"]);
+        let config = stream_config(&cli, protocol::VIDEO_CODEC_H264);
+        assert_eq!(config.target_fps, 120);
+        assert_eq!(config.max_dimension, 1440);
+        assert_eq!(config.bitrate_bps, 25_000_000);
+    }
+
+    #[test]
+    fn explicit_high_refresh_resolution_is_respected() {
+        let cli = parse(&[
+            "ioscpy",
+            "--profile",
+            "high-refresh",
+            "--fps",
+            "120",
+            "--max-dimension",
+            "1920",
+            "--bitrate-mbps",
+            "30",
+        ]);
+        let config = stream_config(&cli, protocol::VIDEO_CODEC_H264);
+        assert_eq!(config.max_dimension, 1920);
+        assert_eq!(config.bitrate_bps, 30_000_000);
+    }
 }

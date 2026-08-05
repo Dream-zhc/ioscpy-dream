@@ -271,10 +271,12 @@ The default remains the original compatibility profile (45 FPS, 1600 px longest
 side). Newer builds can negotiate stream settings with the device:
 
 ```bash
-ioscpy --profile balanced       # 60 FPS, general-purpose settings
-ioscpy --profile latency        # 60 FPS, smaller low-latency frame
-ioscpy --profile high-refresh   # experimental 90 FPS request
-ioscpy --profile high-refresh --fps 120 --max-dimension 1080
+ioscpy --profile quality        # 60 FPS, 2160 long edge, 25 Mbps
+ioscpy --profile balanced       # 60 FPS, 1800 long edge, 16 Mbps
+ioscpy --profile latency        # 60 FPS, 1280 long edge, short queues
+ioscpy --profile high-refresh   # 90 FPS, 1600 long edge, 18 Mbps
+ioscpy --profile high-refresh --fps 120  # 1440 long edge, 25 Mbps
+ioscpy --input-debug            # trace Mac touch sends and device HID submission
 ```
 
 Advanced overrides include `--bitrate-mbps` and `--keyframe-seconds`. A headless

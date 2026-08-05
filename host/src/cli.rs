@@ -40,6 +40,12 @@ pub struct Cli {
     #[arg(long)]
     pub debug: bool,
 
+    /// Trace mouse-to-touch delivery on both the Mac and device. This is meant
+    /// for diagnosing jailbreak/input backend compatibility and is intentionally
+    /// separate from the much noisier general --debug output.
+    #[arg(long)]
+    pub input_debug: bool,
+
     /// Force MJPEG instead of H.264, in case H.264 acts up on some device.
     #[arg(long)]
     pub mjpeg: bool,

@@ -495,6 +495,36 @@ pub struct DeviceStreamStats {
     pub encode_ms_avg: f64,
     #[serde(default)]
     pub send_ms_avg: f64,
+    #[serde(default)]
+    pub input: DeviceInputStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceInputStats {
+    #[serde(default)]
+    pub route: String,
+    #[serde(default)]
+    pub client_ready: bool,
+    #[serde(default)]
+    pub monitor_ready: bool,
+    #[serde(default)]
+    pub sender_id: u64,
+    #[serde(default)]
+    pub touch_commands: u64,
+    #[serde(default)]
+    pub touch_submitted: u64,
+    #[serde(default)]
+    pub touch_without_sender: u64,
+    #[serde(default)]
+    pub last_phase: u8,
+    #[serde(default)]
+    pub last_x: f32,
+    #[serde(default)]
+    pub last_y: f32,
+    #[serde(default)]
+    pub dispatched_events: u64,
+    #[serde(default)]
+    pub dispatch_failures: u64,
 }
 
 fn default_level() -> String {
