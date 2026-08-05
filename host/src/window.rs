@@ -382,8 +382,8 @@ fn open_window(title: &str, w: usize, h: usize) -> Result<Window> {
         h,
         WindowOptions {
             resize: true,
-            // The buffer we present is already window-sized and letterboxed (see
-            // `scale_frame`), so Stretch blits it 1:1.
+            // On macOS the source-sized letterbox is stretched by minifb's native
+            // Metal renderer. Other platforms use the CPU compatibility path.
             scale_mode: ScaleMode::Stretch,
             ..WindowOptions::default()
         },
@@ -541,6 +541,145 @@ fn bilerp(p00: u32, p10: u32, p01: u32, p11: u32, wx: f32, wy: f32) -> u32 {
     out
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderBackend {
+    /// Upload the source-sized canvas and let minifb's native macOS Metal
+    /// renderer perform the final window/backing-scale conversion.
+    NativeGpu,
+    /// Compatibility path used on non-macOS hosts or when explicitly requested.
+    CpuBilinear,
+}
+
+struct FrameRenderer {
+    backend: RenderBackend,
+    combined: Vec<u32>,
+}
+
+impl FrameRenderer {
+    fn new() -> Self {
+        #[cfg(target_os = "macos")]
+        let backend = if std::env::var_os("IOSCPY_CPU_RENDERER").is_some() {
+            RenderBackend::CpuBilinear
+        } else {
+            RenderBackend::NativeGpu
+        };
+        #[cfg(not(target_os = "macos"))]
+        let backend = RenderBackend::CpuBilinear;
+
+        crate::debug!("render backend: {backend:?}");
+        Self {
+            backend,
+            combined: Vec::new(),
+        }
+    }
+
+    fn present(
+        &mut self,
+        window: &mut Window,
+        frame: &DecodedFrame,
+        content_w: usize,
+        win_h: usize,
+        sidebar_down: Option<usize>,
+    ) -> Result<()> {
+        match self.backend {
+            RenderBackend::NativeGpu => {
+                self.present_native_gpu(window, frame, content_w, win_h, sidebar_down)
+            }
+            RenderBackend::CpuBilinear => {
+                self.present_cpu(window, frame, content_w, win_h, sidebar_down)
+            }
+        }
+    }
+
+    /// Build a source-resolution canvas with native pixels centered in a black
+    /// letterbox. The canvas has the same aspect ratio as the window's content
+    /// area, so minifb's Metal Stretch pass scales it without distorting the
+    /// phone. This replaces the old per-pixel CPU bilinear scaler on macOS.
+    fn present_native_gpu(
+        &mut self,
+        window: &mut Window,
+        frame: &DecodedFrame,
+        content_w: usize,
+        win_h: usize,
+        sidebar_down: Option<usize>,
+    ) -> Result<()> {
+        let content_aspect = content_w.max(1) as f64 / win_h.max(1) as f64;
+        let frame_aspect = frame.width.max(1) as f64 / frame.height.max(1) as f64;
+        let (canvas_w, canvas_h) = if content_aspect >= frame_aspect {
+            (
+                ((frame.height as f64 * content_aspect).ceil() as usize).max(frame.width),
+                frame.height,
+            )
+        } else {
+            (
+                frame.width,
+                ((frame.width as f64 / content_aspect).ceil() as usize).max(frame.height),
+            )
+        };
+        let sidebar_src = ((canvas_h as f64 * sidebar::WIDTH as f64 / win_h.max(1) as f64).round()
+            as usize)
+            .max(1);
+        let stride = canvas_w + sidebar_src;
+
+        self.combined.clear();
+        self.combined.resize(stride * canvas_h, 0);
+        let x_off = (canvas_w - frame.width) / 2;
+        let y_off = (canvas_h - frame.height) / 2;
+        for y in 0..frame.height {
+            let src = y * frame.width;
+            let dst = (y + y_off) * stride + x_off;
+            self.combined[dst..dst + frame.width]
+                .copy_from_slice(&frame.buf[src..src + frame.width]);
+        }
+        sidebar::draw_into(
+            &mut self.combined,
+            stride,
+            canvas_w,
+            sidebar_src,
+            canvas_h,
+            sidebar_down,
+        );
+        window
+            .update_with_buffer(&self.combined, stride, canvas_h)
+            .context("failed to present a GPU-scaled frame")
+    }
+
+    fn present_cpu(
+        &mut self,
+        window: &mut Window,
+        frame: &DecodedFrame,
+        content_w: usize,
+        win_h: usize,
+        sidebar_down: Option<usize>,
+    ) -> Result<()> {
+        let bs = backing_scale(window);
+        let ow = (content_w as f32 * bs).max(1.0);
+        let oh = (win_h as f32 * bs).max(1.0);
+        let down = (2600.0 / (ow + sidebar::WIDTH as f32 * bs))
+            .min(2600.0 / oh)
+            .min(1.0);
+        let content_px = ((ow * down) as usize).max(1);
+        let total_h = ((oh * down) as usize).max(1);
+        let sidebar_px = ((sidebar::WIDTH as f32 * bs * down).round() as usize).max(1);
+        let stride = content_px + sidebar_px;
+
+        self.combined.clear();
+        self.combined.resize(stride * total_h, 0);
+        scale_frame(frame, content_px, total_h, stride, &mut self.combined);
+        sidebar::draw_into(
+            &mut self.combined,
+            stride,
+            content_px,
+            sidebar_px,
+            total_h,
+            sidebar_down,
+        );
+        window
+            .update_with_buffer(&self.combined, stride, total_h)
+            .context("failed to present a CPU-scaled frame")
+    }
+}
+
 /// Run the window loop on the calling (main) thread until the window closes or
 /// `stop` is set. Blits the latest frame and forwards input each iteration.
 pub fn run_window(
@@ -573,12 +712,16 @@ pub fn run_window(
     let mut current = first;
     let mut last_dims = (current.width, current.height);
     let mut input = InputState::default();
-    let mut combined: Vec<u32> = Vec::new();
+    let mut renderer = FrameRenderer::new();
+    let mut last_present_size = (0usize, 0usize);
+    let mut last_sidebar_down = None;
     let mut last_clip_poll = Instant::now();
     while window.is_open() && !stop.load(Ordering::Relaxed) {
         // Take the newest decoded frame, dropping any older one.
+        let mut frame_changed = false;
         if let Some(decoded) = frames.lock().unwrap().take() {
             current = decoded;
+            frame_changed = true;
         }
 
         // If the frame's shape flipped the phone rotated. Reopen the window at the
@@ -592,6 +735,7 @@ pub fn run_window(
                 w.set_position(pos.0, pos.1);
                 attach_text_input(&mut w, &input_tx);
                 window = w;
+                last_present_size = (0, 0);
             }
         }
 
@@ -610,38 +754,18 @@ pub fn run_window(
         #[cfg(not(target_os = "macos"))]
         pump_keys(&window, &input_tx, &clip);
 
-        // Render a window-sized, letterboxed buffer at the backing (retina)
-        // resolution for minifb to blit 1:1. Both axes are capped together so a
-        // huge window keeps its aspect (and per-frame cost bounded) under Stretch.
-        // Content and sidebar are written directly into one shared buffer, side
-        // by side, instead of composing separate buffers and copying them
-        // together every frame.
-        let bs = backing_scale(&window);
-        let ow = (content_w as f32 * bs).max(1.0);
-        let oh = (gh as f32 * bs).max(1.0);
-        let down = (2600.0 / (ow + sidebar::WIDTH as f32 * bs))
-            .min(2600.0 / oh)
-            .min(1.0);
-        let content_px = ((ow * down) as usize).max(1);
-        let total_h = ((oh * down) as usize).max(1);
-        let sb_px = ((sidebar::WIDTH as f32 * bs * down).round() as usize).max(1);
-        let stride = content_px + sb_px;
-
-        combined.clear();
-        combined.resize(stride * total_h, 0);
-        scale_frame(&current, content_px, total_h, stride, &mut combined);
-        sidebar::draw_into(
-            &mut combined,
-            stride,
-            content_px,
-            sb_px,
-            total_h,
-            input.sidebar_down,
-        );
-
-        window
-            .update_with_buffer(&combined, stride, total_h)
-            .context("failed to present a frame")?;
+        let window_changed = last_present_size != (gw, gh);
+        let sidebar_changed = last_sidebar_down != input.sidebar_down;
+        if frame_changed || window_changed || sidebar_changed {
+            renderer.present(&mut window, &current, content_w, gh, input.sidebar_down)?;
+            last_present_size = (gw, gh);
+            last_sidebar_down = input.sidebar_down;
+        } else {
+            // Process native events without uploading/rescaling an unchanged
+            // video frame. This matters when the phone is static or the window
+            // refresh rate is higher than the capture rate.
+            window.update();
+        }
 
         // Push Mac clipboard changes to the device (rate-limited).
         if last_clip_poll.elapsed() >= Duration::from_millis(300) {
