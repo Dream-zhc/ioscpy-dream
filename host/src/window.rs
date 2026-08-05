@@ -375,7 +375,7 @@ fn scaled_fit(w: usize, h: usize, scale: f32, sidebar_w: usize) -> (usize, usize
 /// rotation instead of resizing it, because minifb only updates its tracked size
 /// on a live user drag. A programmatic resize would leave the size (and so the
 /// rendering and touch mapping) stale.
-fn open_window(title: &str, w: usize, h: usize) -> Result<Window> {
+fn open_window(title: &str, w: usize, h: usize, target_fps: u16) -> Result<Window> {
     let mut window = Window::new(
         title,
         w,
@@ -389,7 +389,7 @@ fn open_window(title: &str, w: usize, h: usize) -> Result<Window> {
         },
     )
     .context("could not open the render window")?;
-    window.set_target_fps(60);
+    window.set_target_fps(usize::from(target_fps.clamp(30, 240)));
     Ok(window)
 }
 
@@ -688,6 +688,7 @@ pub fn run_window(
     stop: Arc<AtomicBool>,
     input_tx: Sender<InputFrame>,
     clip_in: Receiver<String>,
+    target_fps: u16,
 ) -> Result<()> {
     let first = match wait_for_first_frame(&frames, &stop) {
         Some(f) => f,
@@ -704,7 +705,7 @@ pub fn run_window(
     let display_scale = ((sh * 0.92) / long).min((sw * 0.92) / short);
     // Size the first window exactly as a rotation to this shape would.
     let (win_w, win_h) = scaled_fit(first.width, first.height, display_scale, sidebar::WIDTH);
-    let mut window = open_window(title, win_w, win_h)?;
+    let mut window = open_window(title, win_w, win_h, target_fps)?;
     let clip = Arc::new(Mutex::new(ClipState::default()));
     install_key_monitor(input_tx.clone(), clip.clone());
     attach_text_input(&mut window, &input_tx);
@@ -716,6 +717,8 @@ pub fn run_window(
     let mut last_present_size = (0usize, 0usize);
     let mut last_sidebar_down = None;
     let mut last_clip_poll = Instant::now();
+    let mut present_window = Instant::now();
+    let mut presented_frames = 0u64;
     while window.is_open() && !stop.load(Ordering::Relaxed) {
         // Take the newest decoded frame, dropping any older one.
         let mut frame_changed = false;
@@ -731,7 +734,7 @@ pub fn run_window(
             last_dims = (current.width, current.height);
             let (nw, nh) = scaled_fit(current.width, current.height, display_scale, sidebar::WIDTH);
             let pos = window.get_position();
-            if let Ok(mut w) = open_window(title, nw, nh) {
+            if let Ok(mut w) = open_window(title, nw, nh, target_fps) {
                 w.set_position(pos.0, pos.1);
                 attach_text_input(&mut w, &input_tx);
                 window = w;
@@ -760,11 +763,22 @@ pub fn run_window(
             renderer.present(&mut window, &current, content_w, gh, input.sidebar_down)?;
             last_present_size = (gw, gh);
             last_sidebar_down = input.sidebar_down;
+            if frame_changed {
+                presented_frames += 1;
+            }
         } else {
             // Process native events without uploading/rescaling an unchanged
             // video frame. This matters when the phone is static or the window
             // refresh rate is higher than the capture rate.
             window.update();
+        }
+        if present_window.elapsed() >= Duration::from_secs(1) {
+            crate::debug!(
+                "present: {:.1} fps ({presented_frames} new frames, target {target_fps})",
+                presented_frames as f64 / present_window.elapsed().as_secs_f64()
+            );
+            present_window = Instant::now();
+            presented_frames = 0;
         }
 
         // Push Mac clipboard changes to the device (rate-limited).

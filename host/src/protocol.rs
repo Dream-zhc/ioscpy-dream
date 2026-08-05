@@ -466,9 +466,15 @@ pub struct DeviceStreamStats {
     #[serde(default)]
     pub requested_fps: u16,
     #[serde(default)]
+    pub configured_max_dimension: u16,
+    #[serde(default)]
     pub max_dimension: u16,
     #[serde(default)]
     pub bitrate_bps: u32,
+    #[serde(default)]
+    pub encode_inflight: u32,
+    #[serde(default)]
+    pub send_backlog: u32,
     #[serde(default)]
     pub capture_ticks: u64,
     #[serde(default)]

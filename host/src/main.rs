@@ -47,8 +47,10 @@ struct BenchReport {
     height: u32,
     received_frames: u64,
     decoded_frames: u64,
+    unique_decoded_frames: u64,
     keyframes: u64,
     received_fps: f64,
+    unique_fps: f64,
     bytes: u64,
     average_kilobytes_per_frame: f64,
     megabytes_per_second: f64,
@@ -99,6 +101,11 @@ fn stream_config(cli: &Cli, codec: u8) -> protocol::StreamConfig {
 
     if let Some(fps) = cli.fps {
         config.target_fps = fps;
+    }
+    if config.target_fps >= 120 && cli.max_dimension.is_none() {
+        config.max_dimension = config.max_dimension.min(1080);
+        config.bitrate_bps = config.bitrate_bps.max(12_000_000);
+        config.latency_mode = LatencyMode::HighRefresh;
     }
     if let Some(max_dimension) = cli.max_dimension {
         config.max_dimension = max_dimension;
@@ -240,7 +247,15 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
     });
 
     let window_title = format!("ioscpy v{HOST_VERSION}");
-    let result = window::run_window(&window_title, slot, stop.clone(), input_tx, clip_in_rx);
+    let display_fps = stream_config(cli, protocol::VIDEO_CODEC_H264).target_fps;
+    let result = window::run_window(
+        &window_title,
+        slot,
+        stop.clone(),
+        input_tx,
+        clip_in_rx,
+        display_fps,
+    );
     stop.store(true, Ordering::Relaxed);
     let _ = net.join();
     result
@@ -460,13 +475,14 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
 
     let start = Instant::now();
     let window = Duration::from_secs(secs);
-    let (mut frames, mut bytes, mut decoded, mut h264_frames, mut keyframes) =
-        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut frames, mut bytes, mut decoded, mut unique_decoded, mut h264_frames, mut keyframes) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut decode_total = Duration::ZERO;
     let mut read_total = Duration::ZERO;
     let (mut w, mut h) = (0u32, 0u32);
     let mut h264_dec: Option<h264::H264Decoder> = None;
     let mut last_device_stats: Option<protocol::DeviceStreamStats> = None;
+    let mut last_fingerprint: Option<u64> = None;
 
     while start.elapsed() < window {
         let rt = Instant::now();
@@ -492,15 +508,25 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
                         if let h264::Decoded::Frame(f) = d.decode(data) {
                             decode_total += t.elapsed();
                             decoded += 1;
+                            let fingerprint = video::frame_fingerprint(&f);
+                            if last_fingerprint != Some(fingerprint) {
+                                unique_decoded += 1;
+                                last_fingerprint = Some(fingerprint);
+                            }
                             (w, h) = (f.width as u32, f.height as u32);
                         }
                     }
                 } else {
                     // MJPEG frame: decode to check it's valid and time it.
                     let t = Instant::now();
-                    if video::decode_jpeg(data).is_some() {
+                    if let Some(f) = video::decode_jpeg(data) {
                         decode_total += t.elapsed();
                         decoded += 1;
+                        let fingerprint = video::frame_fingerprint(&f);
+                        if last_fingerprint != Some(fingerprint) {
+                            unique_decoded += 1;
+                            last_fingerprint = Some(fingerprint);
+                        }
                     }
                 }
             }
@@ -529,8 +555,10 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
         height: h,
         received_frames: frames,
         decoded_frames: decoded,
+        unique_decoded_frames: unique_decoded,
         keyframes,
         received_fps: frames as f64 / elapsed.max(f64::EPSILON),
+        unique_fps: unique_decoded as f64 / elapsed.max(f64::EPSILON),
         bytes,
         average_kilobytes_per_frame: bytes as f64 / n / 1024.0,
         megabytes_per_second: bytes as f64 / elapsed.max(f64::EPSILON) / 1024.0 / 1024.0,
@@ -546,6 +574,10 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     println!(
         "bench: {frames} {kind} frames in {elapsed:.1}s = {:.1} fps",
         frames as f64 / elapsed
+    );
+    println!(
+        "  decoded {decoded}, unique {unique_decoded} = {:.1} unique fps",
+        unique_decoded as f64 / elapsed.max(f64::EPSILON)
     );
     println!(
         "  {w}x{h}, avg {:.1} KB/frame, ~{:.2} MB/s over the wire",

@@ -61,6 +61,9 @@ static uint64_t clipHash(NSString *t) {
     NSUInteger _sendBacklog;
     uint64_t _encoderEpoch;
     IOSPYStreamConfig _config;
+    uint16_t _effectiveMaxDimension;
+    uint32_t _effectiveBitrate;
+    NSUInteger _healthyStatsWindows;
 
     double _streamStartMs;
     double _lastStatsMs;
@@ -88,6 +91,8 @@ static uint64_t clipHash(NSString *t) {
         _fd = -1;
         _config = IOSPYParseStreamConfig(nil);
         _codec = _config.codec;
+        _effectiveMaxDimension = _config.max_dimension;
+        _effectiveBitrate = _config.bitrate_bps;
         _captureQueue = dispatch_queue_create("com.ioscpy.capture", DISPATCH_QUEUE_SERIAL);
         _sendQueue = dispatch_queue_create("com.ioscpy.send", DISPATCH_QUEUE_SERIAL);
         _clipQueue = dispatch_queue_create("com.ioscpy.clip", DISPATCH_QUEUE_SERIAL);
@@ -336,6 +341,9 @@ static uint64_t clipHash(NSString *t) {
     _captureMsTotal = 0;
     _encodeMsTotal = 0;
     _sendMsTotal = 0;
+    _effectiveMaxDimension = _config.max_dimension;
+    _effectiveBitrate = _config.bitrate_bps;
+    _healthyStatsWindows = 0;
 }
 
 - (void)emitStatsIfNeeded {
@@ -343,19 +351,57 @@ static uint64_t clipHash(NSString *t) {
     if (_fd < 0 || now - _lastStatsMs < 1000.0) {
         return;
     }
+    double captureAvg = _capturedFrames ? _captureMsTotal / _capturedFrames : 0;
+    double encodeAvg = _encodedFrames ? _encodeMsTotal / _encodedFrames : 0;
+    double sendAvg = _sentFrames ? _sendMsTotal / _sentFrames : 0;
+    double frameBudget = 1000.0 / MAX(_config.target_fps, 1);
+    double dropRatio = _captureTicks ? (double)_droppedFrames / _captureTicks : 0;
+
+    // High-refresh and explicit low-latency modes trade resolution for freshness.
+    // React slowly enough to avoid oscillation, but cut promptly when queues or
+    // processing time exceed the frame budget.
+    if (_config.latency_mode >= IOSPYLatencyLow) {
+        BOOL pressured = dropRatio > 0.12 || captureAvg + encodeAvg > frameBudget * 0.85 ||
+                         _h264InFlight >= 2 || _sendBacklog >= 2;
+        if (pressured && _effectiveMaxDimension > 640) {
+            uint16_t next = MAX((uint16_t)640,
+                                (uint16_t)((double)_effectiveMaxDimension * 0.90));
+            next &= ~1u;
+            _effectiveMaxDimension = next;
+            _healthyStatsWindows = 0;
+        } else if (!pressured && dropRatio < 0.02 &&
+                   captureAvg + encodeAvg < frameBudget * 0.60) {
+            _healthyStatsWindows++;
+            if (_healthyStatsWindows >= 3 && _effectiveMaxDimension < _config.max_dimension) {
+                uint16_t next = MIN(_config.max_dimension,
+                                    (uint16_t)((double)_effectiveMaxDimension * 1.05));
+                _effectiveMaxDimension = next & ~1u;
+                _healthyStatsWindows = 0;
+            }
+        } else {
+            _healthyStatsWindows = 0;
+        }
+
+        double ratio = (double)_effectiveMaxDimension / MAX(_config.max_dimension, 1);
+        uint32_t scaled = (uint32_t)((double)_config.bitrate_bps * ratio * ratio);
+        _effectiveBitrate = MAX((uint32_t)2000000, MIN(_config.bitrate_bps, scaled));
+    }
     NSDictionary *stats = @{
         @"uptime_ms": @((uint64_t)MAX(now - _streamStartMs, 0)),
         @"requested_fps": @(_config.target_fps),
-        @"max_dimension": @(_config.max_dimension),
-        @"bitrate_bps": @(_config.bitrate_bps),
+        @"configured_max_dimension": @(_config.max_dimension),
+        @"max_dimension": @(_effectiveMaxDimension),
+        @"bitrate_bps": @(_effectiveBitrate),
+        @"encode_inflight": @(_h264InFlight),
+        @"send_backlog": @(_sendBacklog),
         @"capture_ticks": @(_captureTicks),
         @"captured_frames": @(_capturedFrames),
         @"encoded_frames": @(_encodedFrames),
         @"sent_frames": @(_sentFrames),
         @"dropped_frames": @(_droppedFrames),
-        @"capture_ms_avg": @(_capturedFrames ? _captureMsTotal / _capturedFrames : 0),
-        @"encode_ms_avg": @(_encodedFrames ? _encodeMsTotal / _encodedFrames : 0),
-        @"send_ms_avg": @(_sentFrames ? _sendMsTotal / _sentFrames : 0),
+        @"capture_ms_avg": @(captureAvg),
+        @"encode_ms_avg": @(encodeAvg),
+        @"send_ms_avg": @(sendAvg),
     };
     NSData *body = [NSJSONSerialization dataWithJSONObject:stats options:0 error:nil];
     if (body) {
@@ -430,7 +476,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
 - (void)captureAndSendJPEG:(int)fd {
     int width = 0, height = 0;
     double captureMs = 0, encodeMs = 0;
-    NSData *jpeg = IOSPYCaptureScreenJPEG(_config.max_dimension, kQuality, &width, &height,
+    NSData *jpeg = IOSPYCaptureScreenJPEG(_effectiveMaxDimension, kQuality, &width, &height,
                                           &captureMs, &encodeMs);
     if (!jpeg) {
         _droppedFrames++;
@@ -469,7 +515,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     }
     int width = 0, height = 0;
     double captureStart = streamNowMs();
-    IOSurfaceRef surface = IOSPYCaptureScreenSurface(_config.max_dimension, &width, &height);
+    IOSurfaceRef surface = IOSPYCaptureScreenSurface(_effectiveMaxDimension, &width, &height);
     double captureMs = streamNowMs() - captureStart;
     if (!surface || width < 2 || height < 2) {
         _droppedFrames++;
@@ -486,7 +532,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                                        width:width
                                       height:height
                                          fps:fps
-                                     bitrate:_config.bitrate_bps
+                                     bitrate:_effectiveBitrate
                             keyframeInterval:MAX(_config.keyframe_interval_frames, 1)
                                forceKeyframe:forceKeyframe
                                   completion:^(NSData *avcc, BOOL isKey, BOOL hardError) {
