@@ -250,6 +250,101 @@ final class VideoDecoder: @unchecked Sendable {
     }
 }
 
+/// Decouples socket reads from VideoToolbox submission and enforces a bounded
+/// encoded-frame queue. If the decoder falls behind, continuing to decode every
+/// old inter-frame only increases visible control latency. Instead, discard the
+/// stale chain, request a fresh keyframe, and resume from the newest decodable
+/// point.
+final class VideoDecodePump: @unchecked Sendable {
+    private let decoder: VideoDecoder
+    private let queue = DispatchQueue(label: "com.ioscpy.video-decode", qos: .userInteractive)
+    private let lock = NSLock()
+    private let maxPendingFrames: Int
+    private var pendingFrames = 0
+    private var generation: UInt64 = 1
+    private var waitingForKeyframe = true
+    private var lastKeyframeRequestNanos: UInt64 = 0
+
+    var onNeedKeyframe: (@Sendable () -> Void)?
+    var onDroppedStaleChain: (@Sendable () -> Void)?
+
+    init(decoder: VideoDecoder, maxPendingFrames: Int = 3) {
+        self.decoder = decoder
+        self.maxPendingFrames = max(1, maxPendingFrames)
+    }
+
+    func submit(_ packet: VideoPacket) {
+        var shouldRequestKeyframe = false
+        var shouldReportDrop = false
+        let currentGeneration: UInt64
+
+        lock.lock()
+        if waitingForKeyframe && !packet.isKeyframe {
+            shouldRequestKeyframe = keyframeRequestDueLocked()
+            lock.unlock()
+            if shouldRequestKeyframe { onNeedKeyframe?() }
+            return
+        }
+
+        if packet.isKeyframe {
+            waitingForKeyframe = false
+        } else if pendingFrames >= maxPendingFrames {
+            // Invalidate queued submissions logically. DispatchQueue work items
+            // cannot be removed, but their generation check makes them no-ops,
+            // allowing the requested keyframe to become the next decoded frame.
+            generation &+= 1
+            pendingFrames = 0
+            waitingForKeyframe = true
+            shouldRequestKeyframe = keyframeRequestDueLocked()
+            shouldReportDrop = true
+            lock.unlock()
+            if shouldReportDrop { onDroppedStaleChain?() }
+            if shouldRequestKeyframe { onNeedKeyframe?() }
+            return
+        }
+
+        pendingFrames += 1
+        currentGeneration = generation
+        lock.unlock()
+
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let valid = self.generation == currentGeneration
+            self.lock.unlock()
+            if valid {
+                self.decoder.decode(packet)
+            }
+            self.finish(generation: currentGeneration)
+        }
+    }
+
+    func reset() {
+        lock.lock()
+        generation &+= 1
+        pendingFrames = 0
+        waitingForKeyframe = true
+        lastKeyframeRequestNanos = 0
+        lock.unlock()
+        queue.async { [decoder] in decoder.invalidate() }
+    }
+
+    private func finish(generation completedGeneration: UInt64) {
+        lock.lock()
+        if generation == completedGeneration, pendingFrames > 0 {
+            pendingFrames -= 1
+        }
+        lock.unlock()
+    }
+
+    private func keyframeRequestDueLocked() -> Bool {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now &- lastKeyframeRequestNanos >= 250_000_000 else { return false }
+        lastKeyframeRequestNanos = now
+        return true
+    }
+}
+
 final class PixelBufferEnvelope: @unchecked Sendable {
     let buffer: CVPixelBuffer
 

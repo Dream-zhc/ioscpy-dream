@@ -62,6 +62,7 @@ static uint64_t clipHash(NSString *t) {
     NSLock *_socketWriteLock;      // prevents frame/control write interleaving
     uint8_t _codec;                // 0 = MJPEG, 1 = H.264, 2 = HEVC
     BOOL _needKeyframe;            // force a hardware-codec keyframe on the next frame
+    BOOL _dropUntilKeyframe;       // suppress dependent frames after an encoded frame is lost
     NSUInteger _h264InFlight;
     NSUInteger _sendBacklog;
     uint64_t _encoderEpoch;
@@ -259,7 +260,10 @@ static uint64_t clipHash(NSString *t) {
         } else if (header.type == IOSPYMsgStopStream) {
             dispatch_async(_captureQueue, ^{ [self stopCapture]; });
         } else if (header.type == IOSPYMsgRequestKeyframe) {
-            dispatch_async(_captureQueue, ^{ self->_needKeyframe = YES; });
+            dispatch_async(_captureQueue, ^{
+                self->_needKeyframe = YES;
+                self->_dropUntilKeyframe = YES;
+            });
         } else if (header.type == IOSPYMsgInputTouch && payload.length >= 10) {
             const uint8_t *b = (const uint8_t *)payload.bytes;
             uint8_t phase = b[0];
@@ -418,6 +422,7 @@ static uint64_t clipHash(NSString *t) {
     [_encoder invalidate];
     _h264InFlight = 0;
     _sendBacklog = 0;
+    _dropUntilKeyframe = NO;
 }
 
 - (void)resetStreamStats {
@@ -614,6 +619,13 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     if (!IOSPYHardwareVideoAvailable(_codec)) {
         return NO;
     }
+    // Do not create more encoded work while the transport already has two
+    // frames waiting. This keeps transient USB/Wi-Fi stalls from turning into a
+    // visible latency ramp that takes seconds to drain.
+    if (_sendBacklog >= 2) {
+        _droppedFrames++;
+        return YES;
+    }
     // Compression latency is not the same as throughput. At 2160p the hardware
     // callback may arrive ~35-45 ms later while still accepting a new frame every
     // 8.3 ms. Two in-flight frames therefore capped throughput near 50 FPS.
@@ -689,14 +701,24 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
             self->_encodeMsTotal += encodeMs;
             if (isKey) {
                 self->_needKeyframe = NO;
-            }
-
-            // Keep the socket queue short. If three encoded frames are already
-            // waiting, discard this one and force a new keyframe so the decoder
-            // can recover without replaying stale inter-frames.
-            if (self->_sendBacklog >= 3) {
+                self->_dropUntilKeyframe = NO;
+            } else if (self->_dropUntilKeyframe) {
+                // Once one encoded inter-frame is lost, later dependent frames
+                // are not useful even when they arrive successfully. Suppress
+                // them until the forced IDR is ready instead of showing a burst
+                // of corruption or delayed recovery on the Mac.
                 self->_droppedFrames++;
                 self->_needKeyframe = YES;
+                return;
+            }
+
+            // Keep the socket queue short. If two encoded frames are already
+            // waiting, discard this one and force a new keyframe so the decoder
+            // can recover without replaying stale inter-frames.
+            if (self->_sendBacklog >= 2) {
+                self->_droppedFrames++;
+                self->_needKeyframe = YES;
+                self->_dropUntilKeyframe = YES;
                 return;
             }
             self->_sendBacklog++;
@@ -727,6 +749,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                     } else {
                         self->_droppedFrames++;
                         self->_needKeyframe = YES;
+                        self->_dropUntilKeyframe = YES;
                     }
                 });
             });

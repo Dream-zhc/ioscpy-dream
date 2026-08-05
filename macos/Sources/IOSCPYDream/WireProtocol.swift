@@ -63,7 +63,7 @@ struct WireFrame {
 
 struct HelloPayload: Encodable {
     let role = "host"
-    let hostVersion = "0.3.0-dream.3"
+    let hostVersion = "0.3.0-dream.4"
     let protocolVersion = Wire.version
     let nonce: String
     let hostID: String
@@ -282,4 +282,26 @@ func makeScrollPayload(
     }
     data.appendBE(timestampNanos)
     return data
+}
+
+func mergeScrollPayload(_ older: Data?, _ newer: Data) -> Data {
+    guard newer.count >= 28 else { return newer }
+    guard let older, older.count >= 28 else { return newer }
+
+    func readFloat(_ data: Data, _ offset: Int) -> Float {
+        Float(bitPattern: data.readBE(UInt32.self, at: offset))
+    }
+
+    let deltaX = min(max(readFloat(older, 4) + readFloat(newer, 4), -240), 240)
+    let deltaY = min(max(readFloat(older, 8) + readFloat(newer, 8), -240), 240)
+    return makeScrollPayload(
+        phase: newer[0],
+        momentumPhase: newer[1],
+        precise: older[2] != 0 || newer[2] != 0,
+        deltaX: deltaX,
+        deltaY: deltaY,
+        x: readFloat(newer, 12),
+        y: readFloat(newer, 16),
+        timestampNanos: newer.readBE(UInt64.self, at: 20)
+    )
 }

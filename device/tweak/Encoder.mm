@@ -88,8 +88,12 @@ BOOL IOSPYHardwareVideoAvailable(uint8_t codec) {
 
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    // External in-flight surfaces keep the hardware pipeline full. Allowing
+    // VideoToolbox to retain another 4-6 frames internally created a second,
+    // invisible queue and made glass-to-glass latency vary dramatically under
+    // transient load. Keep the encoder's own reorder/delay queue minimal.
     [self setProp:kVTCompressionPropertyKey_MaxFrameDelayCount
-           number:(fps >= 100 ? 6 : 4)];
+           number:(fps >= 90 ? 1 : 2)];
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_MaximizePowerEfficiency,
                          kCFBooleanFalse);
     // High profile gives screen text and gradients better quality per bit than

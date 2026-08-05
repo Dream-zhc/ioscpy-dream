@@ -5,6 +5,11 @@ import Network
 final class TCPTransport: @unchecked Sendable {
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.ioscpy.transport", qos: .userInteractive)
+    // Network.framework callbacks do not align with protocol frame boundaries.
+    // A small read-ahead buffer reduces callback/continuation churn and keeps
+    // video delivery cadence steadier under USB and Wi-Fi burstiness.
+    private var receiveBuffer = Data()
+    private var receiveOffset = 0
 
     init(host: String, port: UInt16) throws {
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
@@ -62,12 +67,25 @@ final class TCPTransport: @unchecked Sendable {
     func receiveExactly(_ count: Int) async throws -> Data {
         guard count >= 0 else { throw ConnectionFailure.protocolError("负数读取长度") }
         if count == 0 { return Data() }
-        var result = Data(capacity: count)
-        while result.count < count {
-            let remaining = count - result.count
-            let chunk = try await receive(minimum: 1, maximum: remaining)
+        while receiveBuffer.count - receiveOffset < count {
+            let missing = count - (receiveBuffer.count - receiveOffset)
+            let chunk = try await receive(
+                minimum: 1,
+                maximum: max(256 * 1024, min(Wire.maxPayload, missing))
+            )
             guard !chunk.isEmpty else { throw ConnectionFailure.disconnected }
-            result.append(chunk)
+            receiveBuffer.append(chunk)
+        }
+        let start = receiveOffset
+        let end = start + count
+        let result = receiveBuffer.subdata(in: start..<end)
+        receiveOffset = end
+        if receiveOffset == receiveBuffer.count {
+            receiveBuffer.removeAll(keepingCapacity: true)
+            receiveOffset = 0
+        } else if receiveOffset >= 512 * 1024 {
+            receiveBuffer.removeSubrange(0..<receiveOffset)
+            receiveOffset = 0
         }
         return result
     }
@@ -239,6 +257,12 @@ final class IOSCPYSession: @unchecked Sendable {
     private var pingTask: Task<Void, Never>?
     private var stopped = false
     private var sequence: UInt64 = 1
+    private let inputStateLock = NSLock()
+    private var pendingTouchMove: Data?
+    private var touchMoveInFlight = false
+    private var pendingScroll: Data?
+    private var scrollInFlight = false
+    private var lastKeyframeRequestNanos: UInt64 = 0
 
     let capabilities: Capabilities
     let issuedPairToken: String?
@@ -304,7 +328,7 @@ final class IOSCPYSession: @unchecked Sendable {
             } catch {
                 if mode == .lan {
                     throw ConnectionFailure.processFailed(
-                        "无法连接 \(host):\(port)。请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.3 手机端。系统错误：\(error.localizedDescription)"
+                        "无法连接 \(host):\(port)。请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.4 手机端。系统错误：\(error.localizedDescription)"
                     )
                 }
                 throw error
@@ -456,12 +480,141 @@ final class IOSCPYSession: @unchecked Sendable {
         }
     }
 
+    private func enqueueLatestTouchMove(_ payload: Data) {
+        inputStateLock.lock()
+        pendingTouchMove = payload
+        let shouldStart = !touchMoveInFlight
+        if shouldStart { touchMoveInFlight = true }
+        inputStateLock.unlock()
+        if shouldStart {
+            realtimeSendQueue.async { [weak self] in self?.drainLatestTouchMove() }
+        }
+    }
+
+    private func drainLatestTouchMove() {
+        inputStateLock.lock()
+        guard let payload = pendingTouchMove else {
+            touchMoveInFlight = false
+            inputStateLock.unlock()
+            return
+        }
+        pendingTouchMove = nil
+        inputStateLock.unlock()
+
+        guard !stopped else {
+            inputStateLock.lock()
+            touchMoveInFlight = false
+            pendingTouchMove = nil
+            inputStateLock.unlock()
+            return
+        }
+        let frame = makeWireFrame(
+            type: .inputTouch,
+            streamID: Wire.channelControl,
+            sequence: nextSequence(),
+            payload: payload
+        )
+        transport.enqueue(frame) { [weak self] error in
+            guard let self else { return }
+            if let error {
+                NSLog("[ioscpy] touch send failed: %@", error.localizedDescription)
+            }
+            self.realtimeSendQueue.async { [weak self] in
+                self?.drainLatestTouchMove()
+            }
+        }
+    }
+
+    private func discardPendingTouchMove() {
+        inputStateLock.lock()
+        pendingTouchMove = nil
+        inputStateLock.unlock()
+    }
+
+    private func enqueueCoalescedScroll(_ payload: Data) {
+        inputStateLock.lock()
+        pendingScroll = mergeScrollPayload(pendingScroll, payload)
+        let shouldStart = !scrollInFlight
+        if shouldStart { scrollInFlight = true }
+        inputStateLock.unlock()
+        if shouldStart {
+            realtimeSendQueue.async { [weak self] in self?.drainCoalescedScroll() }
+        }
+    }
+
+    private func drainCoalescedScroll() {
+        inputStateLock.lock()
+        guard let payload = pendingScroll else {
+            scrollInFlight = false
+            inputStateLock.unlock()
+            return
+        }
+        pendingScroll = nil
+        inputStateLock.unlock()
+
+        guard !stopped else {
+            inputStateLock.lock()
+            scrollInFlight = false
+            pendingScroll = nil
+            inputStateLock.unlock()
+            return
+        }
+        let frame = makeWireFrame(
+            type: .inputScroll,
+            streamID: Wire.channelControl,
+            sequence: nextSequence(),
+            payload: payload
+        )
+        transport.enqueue(frame) { [weak self] error in
+            guard let self else { return }
+            if let error {
+                NSLog("[ioscpy] scroll send failed: %@", error.localizedDescription)
+            }
+            self.realtimeSendQueue.async { [weak self] in
+                self?.drainCoalescedScroll()
+            }
+        }
+    }
+
+    private func takePendingScroll(merging payload: Data) -> Data {
+        inputStateLock.lock()
+        let merged = mergeScrollPayload(pendingScroll, payload)
+        pendingScroll = nil
+        inputStateLock.unlock()
+        return merged
+    }
+
+    private func discardPendingScroll() {
+        inputStateLock.lock()
+        pendingScroll = nil
+        inputStateLock.unlock()
+    }
+
     func updateVideo(_ settings: VideoSettings) async throws {
         try await send(type: .startStream, payload: makeStreamConfig(settings))
     }
 
+    func requestKeyframe() {
+        inputStateLock.lock()
+        let now = DispatchTime.now().uptimeNanoseconds
+        let due = now &- lastKeyframeRequestNanos >= 250_000_000
+        if due { lastKeyframeRequestNanos = now }
+        inputStateLock.unlock()
+        guard due else { return }
+        enqueue(type: .requestKeyframe)
+    }
+
     func sendTouch(phase: UInt8, x: Float, y: Float) {
-        enqueue(type: .inputTouch, payload: makeTouchPayload(phase: phase, x: x, y: y))
+        let payload = makeTouchPayload(phase: phase, x: x, y: y)
+        if phase == 1 {
+            // Pointer callbacks can arrive faster than Network.framework can
+            // commit writes. Retain only the newest move so stale coordinates
+            // never accumulate behind the user's hand.
+            enqueueLatestTouchMove(payload)
+        } else {
+            discardPendingTouchMove()
+            enqueue(type: .inputTouch, payload: payload)
+        }
     }
 
     func sendText(_ text: String) {
@@ -474,7 +627,20 @@ final class IOSCPYSession: @unchecked Sendable {
     }
 
     func sendScroll(_ payload: Data) {
-        enqueue(type: .inputScroll, payload: payload)
+        guard payload.count >= 28 else { return }
+        let phase = payload[0]
+        let momentum = payload[1]
+        if phase == 1 || momentum == 1 {
+            discardPendingScroll()
+            enqueue(type: .inputScroll, payload: payload)
+        } else if phase == 3 || phase == 4 || momentum == 3 || momentum == 4 {
+            enqueue(type: .inputScroll, payload: takePendingScroll(merging: payload))
+        } else {
+            // Trackpads can generate hundreds of tiny delta events per second.
+            // Accumulate their movement while keeping one network write active;
+            // this preserves total distance and momentum without queuing history.
+            enqueueCoalescedScroll(payload)
+        }
     }
 
     func systemAction(_ code: UInt16) {
@@ -496,6 +662,8 @@ final class IOSCPYSession: @unchecked Sendable {
         stopped = true
         readTask?.cancel()
         pingTask?.cancel()
+        discardPendingTouchMove()
+        discardPendingScroll()
         Task { try? await send(type: .stopStream) }
         transport.cancel()
         usbForward?.stop()

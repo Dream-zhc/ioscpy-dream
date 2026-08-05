@@ -120,7 +120,7 @@ struct AppPreferences: Codable, Equatable {
 }
 
 struct PersistedState: Codable {
-    var version: Int = 3
+    var version: Int = 4
     var preferences = AppPreferences()
     var devices: [DeviceProfile] = []
 }
@@ -197,13 +197,16 @@ final class SettingsStore: ObservableObject {
     }
 
     private static func migrate(_ input: PersistedState) -> PersistedState {
-        guard input.version < 3 else { return input }
+        guard input.version < 4 else { return input }
         var output = input
-        output.version = 3
+        output.version = 4
         for index in output.devices.indices {
-            // Re-apply the verified USB profile once after the first native-App
-            // performance regression. Later user changes remain persistent.
-            output.devices[index].video = .extreme
+            // Only the original performance migration resets video settings.
+            // Stability-only schema bumps must preserve the user's explicit
+            // resolution, codec, bitrate, and FPS choices.
+            if input.version < 3 {
+                output.devices[index].video = .extreme
+            }
             output.devices[index].deviceFrame = true
         }
         return output

@@ -22,6 +22,7 @@ final class AppModel: ObservableObject {
 
     private var session: IOSCPYSession?
     private let decoder = VideoDecoder()
+    private lazy var decodePump = VideoDecodePump(decoder: decoder)
     private let audioPlayer = AudioPlayer()
     private let performanceCounters = PerformanceCounters()
     let frameMailbox = VideoFrameMailbox()
@@ -177,10 +178,19 @@ final class AppModel: ObservableObject {
 
     private func configureCallbacks(_ connected: IOSCPYSession) {
         let decoder = self.decoder
+        let decodePump = self.decodePump
         let counters = performanceCounters
+        decoder.onDecodeError = { [weak connected] error in
+            NSLog("[ioscpy] decode: %@", error)
+            connected?.requestKeyframe()
+        }
+        decodePump.onNeedKeyframe = { [weak connected] in connected?.requestKeyframe() }
+        decodePump.onDroppedStaleChain = {
+            NSLog("[ioscpy] decoder backlog discarded; requesting fresh keyframe")
+        }
         connected.onVideo = { packet in
             counters.recordReceived(bytes: packet.bytes.count)
-            decoder.decode(packet)
+            decodePump.submit(packet)
         }
         connected.onStats = { data in
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
@@ -265,7 +275,7 @@ final class AppModel: ObservableObject {
         statsTask = nil
         session?.stop(userInitiated: true)
         session = nil
-        decoder.invalidate()
+        decodePump.reset()
         audioPlayer.stop()
         blackScreenEnabled = false
         screen = .home
@@ -277,7 +287,7 @@ final class AppModel: ObservableObject {
         session = nil
         statsTask?.cancel()
         statsTask = nil
-        decoder.invalidate()
+        decodePump.reset()
         audioPlayer.stop()
         guard !userDisconnected, let device = currentDevice else {
             screen = .home
