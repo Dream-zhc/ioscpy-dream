@@ -21,6 +21,8 @@ packaging/repo/out/
 
 # macOS
 .DS_Store
+macos/.build/
+dist/
 
 # Editor and local tooling state, not part of the project
 .vscode/

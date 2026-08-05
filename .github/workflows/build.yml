@@ -17,8 +17,8 @@ concurrency:
 
 jobs:
   host-checks:
-    name: Rust format, lint, and tests
-    runs-on: macos-14
+    name: Rust protocol checks
+    runs-on: macos-26
     timeout-minutes: 20
 
     steps:
@@ -37,9 +37,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             host/target
-          key: ${{ runner.os }}-checks-${{ hashFiles('host/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-checks-${{ hashFiles('host/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-checks-
+            ${{ runner.os }}-${{ runner.arch }}-checks-
 
       - name: Check formatting
         run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
@@ -51,68 +51,58 @@ jobs:
         run: cargo test --manifest-path host/Cargo.toml --locked --all-targets
 
   macos-host:
-    name: macOS host (universal)
-    runs-on: macos-14
+    name: Native macOS 26 app
+    runs-on: macos-26
     timeout-minutes: 30
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install Rust targets
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
-      - name: Cache Cargo build data
+      - name: Cache Swift build data
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            host/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('host/Cargo.lock') }}
+          path: macos/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-swift-${{ hashFiles('macos/Package.swift', 'macos/Sources/**/*.swift') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-swift-
 
-      - name: Build macOS host binaries
+      - name: Verify build environment
         run: |
-          cargo build --manifest-path host/Cargo.toml --release --locked --target aarch64-apple-darwin
-          cargo build --manifest-path host/Cargo.toml --release --locked --target x86_64-apple-darwin
+          swift --version
+          test "$(uname -m)" = arm64
+          xcrun --show-sdk-version
 
-      - name: Create universal macOS binary
+      - name: Build native app bundle
         run: |
-          mkdir -p dist/macos
-          lipo -create \
-            host/target/aarch64-apple-darwin/release/ioscpy \
-            host/target/x86_64-apple-darwin/release/ioscpy \
-            -output dist/macos/ioscpy
-          chmod +x dist/macos/ioscpy
-          codesign --force --sign - dist/macos/ioscpy
-          file dist/macos/ioscpy
-          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' host/Cargo.toml | head -1)"
-          ARCHIVE="dist/ioscpy-${VERSION}-macos-universal.tar.gz"
-          tar -czf "$ARCHIVE" -C dist/macos ioscpy
-          shasum -a 256 dist/macos/ioscpy "$ARCHIVE" > dist/SHA256SUMS-macos
-          printf '{"version":"%s","commit":"%s","platform":"macos","architectures":["arm64","x86_64"]}\n' \
-            "$VERSION" "$GITHUB_SHA" > dist/build-manifest-macos.json
+          chmod +x scripts/build-macos-app.sh
+          scripts/build-macos-app.sh dist/macos
+          codesign --verify --deep --strict "dist/macos/ioscpy dream.app"
+          file "dist/macos/ioscpy dream.app/Contents/MacOS/ioscpy-dream"
+          plutil -lint "dist/macos/ioscpy dream.app/Contents/Info.plist"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("dist/macos/build-manifest-macos.json")
+          data = json.loads(p.read_text())
+          data["commit"] = "${{ github.sha }}"
+          p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+          PY
 
-      - name: Upload macOS host artifact
+      - name: Upload macOS app artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ioscpy-macos-universal
+          name: ioscpy-macos-app
           path: |
-            dist/macos/ioscpy
-            dist/*.tar.gz
-            dist/SHA256SUMS-macos
-            dist/build-manifest-macos.json
+            dist/macos/*.zip
+            dist/macos/SHA256SUMS-macos
+            dist/macos/build-manifest-macos.json
           if-no-files-found: error
 
   device-package:
     name: iOS device package (${{ matrix.scheme }})
-    runs-on: macos-14
-    timeout-minutes: 30
+    runs-on: macos-26
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -163,4 +153,43 @@ jobs:
             dist/device/${{ matrix.scheme }}/*.deb
             dist/SHA256SUMS-${{ matrix.scheme }}
             dist/build-manifest-${{ matrix.scheme }}.json
+          if-no-files-found: error
+
+  complete-bundle:
+    name: Complete test bundle
+    runs-on: macos-26
+    needs: [host-checks, macos-host, device-package]
+    timeout-minutes: 10
+
+    steps:
+      - name: Download macOS app
+        uses: actions/download-artifact@v4
+        with:
+          name: ioscpy-macos-app
+          path: dist/complete/macos
+
+      - name: Download rootless device package
+        uses: actions/download-artifact@v4
+        with:
+          name: ioscpy-device-rootless
+          path: dist/complete/iphone
+
+      - name: Assemble complete archive
+        run: |
+          VERSION="0.3.0-dream.1"
+          printf '%s\n' \
+            'Install the rootless .deb on the iPhone, run sbreload, then open the macOS app.' \
+            'The macOS app is ad-hoc signed only and is not notarized.' \
+            'USB mode currently requires libimobiledevice: brew install libimobiledevice.' \
+            > dist/complete/TESTING.txt
+          ditto -c -k --keepParent dist/complete "dist/ioscpy-dream-${VERSION}-complete.zip"
+          shasum -a 256 "dist/ioscpy-dream-${VERSION}-complete.zip" > dist/SHA256SUMS-complete
+
+      - name: Upload complete bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioscpy-dream-complete
+          path: |
+            dist/ioscpy-dream-*-complete.zip
+            dist/SHA256SUMS-complete
           if-no-files-found: error

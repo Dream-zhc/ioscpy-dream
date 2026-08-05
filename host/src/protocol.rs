@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 
 pub const MAGIC: u32 = 0x4943_5059; // "ICPY"
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const HEADER_SIZE: usize = 32;
 pub const DEFAULT_PORT: u16 = 27183;
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
@@ -15,6 +15,8 @@ pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 pub const CHANNEL_CONTROL: u64 = 0;
 #[allow(dead_code)]
 pub const CHANNEL_VIDEO: u64 = 1;
+#[allow(dead_code)]
+pub const CHANNEL_AUDIO: u64 = 2;
 
 // Flag bits in the 16-byte VIDEO_FRAME sub-header (not the frame header) that
 // tell the host how to read the encoded bytes. A plain JPEG frame clears them all.
@@ -27,15 +29,19 @@ pub const VIDEO_FLAG_KEYFRAME: u32 = 0x2;
 /// SPS/PPS parameter sets are prepended to this frame's data.
 #[allow(dead_code)]
 pub const VIDEO_FLAG_CONFIG: u32 = 0x4;
+/// HEVC/H.265 payload. Mutually exclusive with [`VIDEO_FLAG_H264`].
+#[allow(dead_code)]
+pub const VIDEO_FLAG_HEVC: u32 = 0x20;
 
 // Codec selector, the 1-byte START_STREAM payload. An empty payload also means
 // MJPEG so an older daemon still streams a picture.
 pub const VIDEO_CODEC_MJPEG: u8 = 0;
 pub const VIDEO_CODEC_H264: u8 = 1;
+pub const VIDEO_CODEC_HEVC: u8 = 2;
 
 /// Versioned START_STREAM payload. Older daemons only inspect byte zero, so the
 /// extended fields remain backward-compatible with the original codec byte.
-pub const STREAM_CONFIG_VERSION: u8 = 1;
+pub const STREAM_CONFIG_VERSION: u8 = 2;
 pub const STREAM_CONFIG_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,7 +100,9 @@ impl StreamConfig {
 
     pub fn decode(payload: &[u8]) -> Self {
         let codec = payload.first().copied().unwrap_or(VIDEO_CODEC_MJPEG);
-        if payload.len() < STREAM_CONFIG_SIZE || payload[1] != STREAM_CONFIG_VERSION {
+        if payload.len() < STREAM_CONFIG_SIZE
+            || (payload[1] != 1 && payload[1] != STREAM_CONFIG_VERSION)
+        {
             return Self::legacy(codec);
         }
         let target_fps = u16::from_be_bytes([payload[2], payload[3]]).clamp(1, 240);
@@ -134,6 +142,7 @@ pub enum MessageType {
     CapabilitiesRequest = 3,
     CapabilitiesResponse = 4,
     Authenticate = 5,
+    PairResult = 6,
     StartStream = 10,
     StopStream = 11,
     VideoFrame = 12,
@@ -141,6 +150,7 @@ pub enum MessageType {
     InputTouch = 20,
     InputKey = 21,
     InputText = 22,
+    InputScroll = 23,
     ClipboardGet = 30,
     ClipboardSet = 31,
     ClipboardChanged = 32,
@@ -148,11 +158,15 @@ pub enum MessageType {
     ScreenInfo = 41,
     SystemAction = 50,
     KeyboardMode = 51,
+    DisplayMode = 52,
+    AudioMode = 53,
+    Unlock = 54,
     Ping = 60,
     Pong = 61,
     Error = 70,
     Log = 71,
     Stats = 72,
+    AudioFrame = 73,
 }
 
 impl MessageType {
@@ -164,6 +178,7 @@ impl MessageType {
             3 => CapabilitiesRequest,
             4 => CapabilitiesResponse,
             5 => Authenticate,
+            6 => PairResult,
             10 => StartStream,
             11 => StopStream,
             12 => VideoFrame,
@@ -171,6 +186,7 @@ impl MessageType {
             20 => InputTouch,
             21 => InputKey,
             22 => InputText,
+            23 => InputScroll,
             30 => ClipboardGet,
             31 => ClipboardSet,
             32 => ClipboardChanged,
@@ -178,11 +194,15 @@ impl MessageType {
             41 => ScreenInfo,
             50 => SystemAction,
             51 => KeyboardMode,
+            52 => DisplayMode,
+            53 => AudioMode,
+            54 => Unlock,
             60 => Ping,
             61 => Pong,
             70 => Error,
             71 => Log,
             72 => Stats,
+            73 => AudioFrame,
             _ => return None,
         })
     }
@@ -663,7 +683,9 @@ mod tests {
 
     #[test]
     fn message_type_roundtrip() {
-        for v in [1u16, 2, 5, 12, 13, 50, 60, 61, 70, 71, 72] {
+        for v in [
+            1u16, 2, 5, 6, 12, 13, 23, 50, 52, 53, 54, 60, 61, 70, 71, 72, 73,
+        ] {
             let mt = MessageType::from_u16(v).unwrap();
             assert_eq!(mt as u16, v);
         }

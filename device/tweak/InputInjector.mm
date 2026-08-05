@@ -1,4 +1,5 @@
 #import "InputInjector.h"
+#import "DisplayController.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -38,6 +39,7 @@ void IOHIDEventSetIntegerValue(IOHIDEventRef e, IOHIDEventField f, int v);
 void IOHIDEventSetFloatValue(IOHIDEventRef e, IOHIDEventField f, IOHIDFloat v);
 void IOHIDEventSetSenderID(IOHIDEventRef e, uint64_t senderID);
 uint64_t IOHIDEventGetSenderID(IOHIDEventRef e);
+uint64_t IOHIDEventGetTimeStamp(IOHIDEventRef e);
 uint32_t IOHIDEventGetType(IOHIDEventRef e);
 
 IOHIDEventRef IOHIDEventCreateKeyboardEvent(CFAllocatorRef allocator, uint64_t timeStamp,
@@ -56,6 +58,7 @@ void IOHIDEventSystemClientRegisterEventCallback(IOHIDEventSystemClientRef, void
 #define kIOHIDDigitizerEventIdentity 0x00000020u
 #define kIOHIDDigitizerTransducerTypeHand 3
 #define kIOHIDEventTypeDigitizer 11
+#define kIOHIDEventTypeKeyboard 3
 
 // Digitizer field selectors (same magic values long-used by touch tools).
 #define kFieldDigitizerIsDisplayInteg 0x000b0019
@@ -79,6 +82,10 @@ static volatile uint64_t gDispatchFailures = 0;
 static volatile uint64_t gTouchCommands = 0;
 static volatile uint64_t gTouchSubmitted = 0;
 static volatile uint64_t gTouchWithoutSender = 0;
+// The physical HID monitor also sees synthetic events. Remember the exact
+// timestamp before dispatch so black-screen mode only wakes for real local
+// touch/button input, never for input sent by the Mac.
+static volatile uint64_t gLastRemoteEventTimestamp = 0;
 static volatile uint8_t gLastTouchPhase = 0xff;
 static volatile float gLastTouchX = 0.0f;
 static volatile float gLastTouchY = 0.0f;
@@ -199,7 +206,14 @@ static void routingConnectionInit(void) {
 // Learn the real digitizer sender id from the first physical touch. Some builds
 // drop injected events without it.
 static void senderCallback(void *target, void *refcon, void *service, IOHIDEventRef event) {
-    if (IOHIDEventGetType(event) == kIOHIDEventTypeDigitizer) {
+    uint32_t type = IOHIDEventGetType(event);
+    uint64_t timestamp = IOHIDEventGetTimeStamp(event);
+    BOOL remote = timestamp != 0 && timestamp == gLastRemoteEventTimestamp;
+    if (!remote && IOSPYRemoteBlackScreenEnabled() &&
+        (type == kIOHIDEventTypeDigitizer || type == kIOHIDEventTypeKeyboard)) {
+        IOSPYRestoreDisplayForLocalInput();
+    }
+    if (type == kIOHIDEventTypeDigitizer) {
         uint64_t sender = IOHIDEventGetSenderID(event);
         if (sender != 0 && sender != gSenderID) {
             gSenderID = sender;
@@ -239,6 +253,7 @@ static BOOL dispatchHIDEvent(IOHIDEventRef event) {
         gDispatchFailures++;
         return NO;
     }
+    gLastRemoteEventTimestamp = IOHIDEventGetTimeStamp(event);
     if (gConnection && gConnectionDispatch) {
         gConnectionDispatch(gConnection, event);
         gDispatchedEvents++;
@@ -463,6 +478,86 @@ BOOL IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
     return submitted;
 }
 
+static dispatch_source_t gScrollTimer = NULL;
+static BOOL gScrollActive = NO;
+static float gScrollX = 0.5f;
+static float gScrollY = 0.5f;
+static float gScrollPendingX = 0;
+static float gScrollPendingY = 0;
+static CFAbsoluteTime gScrollLastInput = 0;
+
+static float clampUnit(float value) {
+    return fminf(0.97f, fmaxf(0.03f, value));
+}
+
+static void ensureScrollTimer(void) {
+    if (gScrollTimer) {
+        return;
+    }
+    gScrollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                          dispatch_get_main_queue());
+    uint64_t interval = NSEC_PER_SEC / 120;
+    dispatch_source_set_timer(gScrollTimer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                              interval, interval / 4);
+    dispatch_source_set_event_handler(gScrollTimer, ^{
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        float magnitude = fabsf(gScrollPendingX) + fabsf(gScrollPendingY);
+        if (!gScrollActive && magnitude > 0.0001f) {
+            gScrollActive = YES;
+            IOSPYInjectTouch(IOSPYTouchDown, 7, gScrollX, gScrollY);
+        }
+        if (gScrollActive && magnitude > 0.0001f) {
+            // Exponential consumption gives coarse wheel notches a short, smooth
+            // glide while precise trackpad deltas remain closely time-aligned.
+            float stepX = gScrollPendingX * 0.32f;
+            float stepY = gScrollPendingY * 0.32f;
+            if (fabsf(stepX) < 0.00025f) stepX = copysignf(0.00025f, stepX);
+            if (fabsf(stepY) < 0.00025f) stepY = copysignf(0.00025f, stepY);
+            if (fabsf(stepX) > fabsf(gScrollPendingX)) stepX = gScrollPendingX;
+            if (fabsf(stepY) > fabsf(gScrollPendingY)) stepY = gScrollPendingY;
+            gScrollPendingX -= stepX;
+            gScrollPendingY -= stepY;
+            gScrollX = clampUnit(gScrollX + stepX);
+            gScrollY = clampUnit(gScrollY + stepY);
+            IOSPYInjectTouch(IOSPYTouchMove, 7, gScrollX, gScrollY);
+        }
+        if (gScrollActive && magnitude <= 0.0001f && now - gScrollLastInput > 0.075) {
+            IOSPYInjectTouch(IOSPYTouchUp, 7, gScrollX, gScrollY);
+            gScrollActive = NO;
+            gScrollPendingX = 0;
+            gScrollPendingY = 0;
+        }
+    });
+    dispatch_resume(gScrollTimer);
+}
+
+void IOSPYInjectScroll(uint8_t phase, uint8_t momentumPhase, BOOL precise,
+                       float deltaX, float deltaY, float x, float y) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ensureScrollTimer();
+        gScrollLastInput = CFAbsoluteTimeGetCurrent();
+        if (!gScrollActive && fabsf(gScrollPendingX) + fabsf(gScrollPendingY) < 0.0001f) {
+            gScrollX = clampUnit(x);
+            gScrollY = clampUnit(y);
+        }
+        // AppKit reports content-scrolling deltas; a synthetic finger must move
+        // in the opposite direction to produce the same content motion.
+        float factor = precise ? 0.0018f : 0.0075f;
+        gScrollPendingX += -deltaX * factor;
+        gScrollPendingY += deltaY * factor;
+        gScrollPendingX = fminf(0.24f, fmaxf(-0.24f, gScrollPendingX));
+        gScrollPendingY = fminf(0.24f, fmaxf(-0.24f, gScrollPendingY));
+
+        BOOL cancelled = phase == 4 || momentumPhase == 4;
+        if (cancelled && gScrollActive) {
+            IOSPYInjectTouch(IOSPYTouchUp, 7, gScrollX, gScrollY);
+            gScrollActive = NO;
+            gScrollPendingX = 0;
+            gScrollPendingY = 0;
+        }
+    });
+}
+
 // Press and release a HID button (e.g. the home button as consumer "menu").
 static void injectButton(uint32_t usagePage, uint32_t usage) {
     hidInit();
@@ -624,6 +719,8 @@ void IOSPYKeyAction(uint8_t code) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
 
+static void actionWake(void);
+
 static id sharedOf(const char *cls) {
     Class c = objc_getClass(cls);
     if (!c) {
@@ -636,6 +733,62 @@ static id sharedOf(const char *cls) {
         return [c performSelector:@selector(sharedInstanceIfExists)];
     }
     return nil;
+}
+
+void IOSPYUnlockWithPasscode(NSString *passcode) {
+    if (passcode.length < 4 || passcode.length > 8) {
+        NSLog(@"[ioscpyhook] refusing unlock passcode with invalid length");
+        return;
+    }
+    NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    if ([passcode rangeOfCharacterFromSet:nonDigits].location != NSNotFound) {
+        NSLog(@"[ioscpyhook] refusing non-numeric unlock passcode");
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id manager = sharedOf("SBLockScreenManager");
+        BOOL locked = NO;
+        SEL lockedSelector = NSSelectorFromString(@"isUILocked");
+        if ([manager respondsToSelector:lockedSelector]) {
+            locked = ((BOOL (*)(id, SEL))objc_msgSend)(manager, lockedSelector);
+        } else {
+            id cover = sharedOf("SBCoverSheetPresentationManager");
+            SEL presented = NSSelectorFromString(@"isPresented");
+            if ([cover respondsToSelector:presented]) {
+                locked = ((BOOL (*)(id, SEL))objc_msgSend)(cover, presented);
+            }
+        }
+        if (!locked) {
+            NSLog(@"[ioscpyhook] auto-unlock skipped: device is not on the lock UI");
+            return;
+        }
+
+        IOSPYRestoreDisplayForLocalInput();
+        actionWake();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            // Re-check immediately before typing. This is the guard that keeps a
+            // delayed reconnect from entering the saved passcode into an app.
+            BOOL stillLocked = YES;
+            if ([manager respondsToSelector:lockedSelector]) {
+                stillLocked = ((BOOL (*)(id, SEL))objc_msgSend)(manager, lockedSelector);
+            }
+            if (!stillLocked) {
+                NSLog(@"[ioscpyhook] auto-unlock cancelled: lock state changed");
+                return;
+            }
+            for (NSUInteger i = 0; i < passcode.length; i++) {
+                unichar digit = [passcode characterAtIndex:i];
+                uint32_t usage = digit == '0' ? 0x27 : (0x1E + (digit - '1'));
+                typeUsage(usage, false);
+            }
+            // Some lock-screen layouts submit at the final digit, while others
+            // accept Return. Sending Return after a short delay is harmless when
+            // the final digit already completed the unlock.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ typeUsage(0x28, false); });
+        });
+    });
 }
 
 // Close Control Center / Notification Center if they're showing. The HID home

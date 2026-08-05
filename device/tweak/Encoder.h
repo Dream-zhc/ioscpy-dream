@@ -1,4 +1,4 @@
-// Hardware H.264 encoder built on VideoToolbox. Lives in the tweak next to the
+// Hardware H.264/HEVC encoder built on VideoToolbox. Lives in the tweak next to the
 // capture path so the screen pixels never leave SpringBoard uncompressed.
 //
 // Everything here is public VideoToolbox/CoreMedia/CoreVideo, so it works on any
@@ -15,15 +15,15 @@ extern "C" {
 
 // Whether the VideoToolbox encode path is plausibly present. The real test is
 // creating a session, which the encoder reports per-frame.
-BOOL IOSPYH264Available(void);
+BOOL IOSPYHardwareVideoAvailable(uint8_t codec);
 
 #ifdef __cplusplus
 }
 #endif
 
-typedef void (^IOSPYH264Completion)(NSData *data, BOOL keyframe, BOOL hardError);
+typedef void (^IOSPYVideoCompletion)(NSData *data, BOOL keyframe, BOOL hardError);
 
-@interface IOSPYH264Encoder : NSObject
+@interface IOSPYVideoEncoder : NSObject
 
 // Encode a BGRA IOSurface to H.264. The session is created lazily and recreated
 // when the frame size or rate changes. Output is AVCC (4-byte length-prefixed
@@ -38,10 +38,11 @@ typedef void (^IOSPYH264Completion)(NSData *data, BOOL keyframe, BOOL hardError)
                  width:(int)width
                 height:(int)height
                    fps:(int)fps
+                 codec:(uint8_t)codec
                bitrate:(uint32_t)bitrate
       keyframeInterval:(int)keyframeInterval
          forceKeyframe:(BOOL)forceKeyframe
-            completion:(IOSPYH264Completion)completion;
+            completion:(IOSPYVideoCompletion)completion;
 
 // Tear down the underlying session (e.g. when the stream stops).
 - (void)invalidate;

@@ -4,7 +4,7 @@
 #import <Foundation/Foundation.h>
 
 #define IOSPY_MAGIC            0x49435059u   // 'ICPY'
-#define IOSPY_PROTOCOL_VERSION 4
+#define IOSPY_PROTOCOL_VERSION 5
 #define IOSPY_HEADER_SIZE      32
 #define IOSPY_DEFAULT_PORT     27183
 #define IOSPY_FRAME_PORT       27184   // loopback channel between tweak and daemon
@@ -12,12 +12,14 @@
 
 #define IOSPY_CHANNEL_CONTROL  0ull
 #define IOSPY_CHANNEL_VIDEO    1ull
+#define IOSPY_CHANNEL_AUDIO    2ull
 
 // Flag bits in the 16-byte VIDEO_FRAME sub-header. JPEG frames leave these clear;
 // the H.264 path sets them so the host knows what the bytes are.
 #define IOSPY_VIDEO_FLAG_H264     0x1u   // payload is H.264 (AVCC) not JPEG
 #define IOSPY_VIDEO_FLAG_KEYFRAME 0x2u   // H.264 keyframe (IDR / sync sample)
 #define IOSPY_VIDEO_FLAG_CONFIG   0x4u   // SPS/PPS parameter sets prepended
+#define IOSPY_VIDEO_FLAG_HEVC     0x20u  // payload is HEVC (AVCC/HVCC NAL framing)
 
 // Capture orientation in flags bits 3-4 (value = orientation - 1: 0=portrait,
 // 1=upsideDown, 2=landscapeLeft, 3=landscapeRight). The frame is always the
@@ -28,10 +30,11 @@
 // START_STREAM codec selector (1-byte payload; empty payload also means MJPEG).
 #define IOSPY_VIDEO_CODEC_MJPEG   0
 #define IOSPY_VIDEO_CODEC_H264    1
+#define IOSPY_VIDEO_CODEC_HEVC    2
 
 // Extended START_STREAM payload. Byte zero remains the codec selector so an old
 // daemon can safely ignore the remaining tuning fields.
-#define IOSPY_STREAM_CONFIG_VERSION 1
+#define IOSPY_STREAM_CONFIG_VERSION 2
 #define IOSPY_STREAM_CONFIG_SIZE    16
 
 typedef NS_ENUM(uint8_t, IOSPYLatencyMode) {
@@ -56,6 +59,7 @@ typedef NS_ENUM(uint16_t, IOSPYMessageType) {
     IOSPYMsgCapabilitiesRequest  = 3,
     IOSPYMsgCapabilitiesResponse = 4,
     IOSPYMsgAuthenticate         = 5,    // host echoes the session token to unlock input
+    IOSPYMsgPairResult           = 6,
     IOSPYMsgStartStream          = 10,
     IOSPYMsgStopStream           = 11,
     IOSPYMsgVideoFrame           = 12,
@@ -63,6 +67,7 @@ typedef NS_ENUM(uint16_t, IOSPYMessageType) {
     IOSPYMsgInputTouch           = 20,
     IOSPYMsgInputKey             = 21,
     IOSPYMsgInputText            = 22,
+    IOSPYMsgInputScroll          = 23,
     IOSPYMsgClipboardGet         = 30,
     IOSPYMsgClipboardSet         = 31,
     IOSPYMsgClipboardChanged     = 32,
@@ -70,11 +75,15 @@ typedef NS_ENUM(uint16_t, IOSPYMessageType) {
     IOSPYMsgScreenInfo           = 41,
     IOSPYMsgSystemAction         = 50,
     IOSPYMsgKeyboardMode         = 51,   // [suppress:u8] hide/show the software keyboard
+    IOSPYMsgDisplayMode          = 52,   // [black:u8] true OLED-off remote mode
+    IOSPYMsgAudioMode            = 53,   // [enabled:u8] system playback audio capture
+    IOSPYMsgUnlock               = 54,   // UTF-8 passcode, handled only on lock screen
     IOSPYMsgPing                 = 60,
     IOSPYMsgPong                 = 61,
     IOSPYMsgError                = 70,
     IOSPYMsgLog                  = 71,
     IOSPYMsgStats                = 72,
+    IOSPYMsgAudioFrame           = 73,
 };
 
 typedef struct {

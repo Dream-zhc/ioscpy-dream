@@ -16,7 +16,7 @@
     NSLock *_writeLock; // guards _tweakFd and writes to it
     int _hostFd;        // the control server's host socket, -1 when none
     NSLock *_hostLock;  // the control server's per-connection write lock
-    BOOL _videoReliable; // YES while an H.264 stream needs in-order delivery
+    BOOL _videoReliable; // YES while an inter-frame H.264/HEVC stream is active
 }
 
 + (instancetype)shared {
@@ -124,7 +124,7 @@
                     reliable = _videoReliable;
                 }
                 if (reliable) {
-                    // H.264: send every frame to the host in order. A blocking
+                    // H.264/HEVC: send every frame to the host in order. A blocking
                     // write backpressures the tweak's encoder instead of dropping
                     // a frame, which would corrupt the inter-frame stream.
                     //
@@ -159,7 +159,9 @@
                     // MJPEG: keep only the latest frame, the pump drops stale ones.
                     [[IOSPYFrameStore shared] setPayload:payload];
                 }
-            } else if (header.type == IOSPYMsgClipboardChanged || header.type == IOSPYMsgStats) {
+            } else if (header.type == IOSPYMsgClipboardChanged ||
+                       header.type == IOSPYMsgStats ||
+                       header.type == IOSPYMsgAudioFrame) {
                 // Relay tweak->host control events and periodic telemetry on the
                 // host socket, serialized with the video pump's writes.
                 int hostFd;
@@ -172,8 +174,10 @@
                     [hostLock lock];
                     // Non-blocking: clipboard and telemetry are best-effort and
                     // must never stall the tweak's capture path.
+                    uint64_t channel = header.type == IOSPYMsgAudioFrame
+                        ? IOSPY_CHANNEL_AUDIO : IOSPY_CHANNEL_CONTROL;
                     IOSPYTryWriteFrame(hostFd, (IOSPYMessageType)header.type,
-                                       IOSPY_CHANNEL_CONTROL, 0, payload);
+                                       channel, 0, payload);
                     [hostLock unlock];
                 }
             }

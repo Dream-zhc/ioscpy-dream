@@ -4,6 +4,9 @@
 #import "Protocol.h"
 #import "InputInjector.h"
 #import "KeyboardSuppression.h"
+#import "PairingOverlay.h"
+#import "DisplayController.h"
+#import "AudioCapture.h"
 
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -44,6 +47,7 @@ static uint64_t clipHash(NSString *t) {
 - (void)sendClipboardChanged:(NSString *)text;
 - (void)resetStreamStats;
 - (void)emitStatsIfNeeded;
+- (void)setAudioEnabled:(BOOL)enabled;
 @end
 
 @implementation IOSPYStreamClient {
@@ -53,10 +57,11 @@ static uint64_t clipHash(NSString *t) {
     dispatch_source_t _timer;
     dispatch_queue_t _clipQueue;   // ALL UIPasteboard access happens here, off-main
     dispatch_source_t _clipTimer;
-    IOSPYH264Encoder *_encoder;    // created lazily on the capture queue
+    IOSPYVideoEncoder *_encoder;   // created lazily on the capture queue
+    IOSPYAudioCapture *_audioCapture;
     NSLock *_socketWriteLock;      // prevents frame/control write interleaving
-    uint8_t _codec;                // 0 = MJPEG, 1 = H.264 (host's request)
-    BOOL _needKeyframe;            // force an H.264 keyframe on the next frame
+    uint8_t _codec;                // 0 = MJPEG, 1 = H.264, 2 = HEVC
+    BOOL _needKeyframe;            // force a hardware-codec keyframe on the next frame
     NSUInteger _h264InFlight;
     NSUInteger _sendBacklog;
     uint64_t _encoderEpoch;
@@ -76,6 +81,8 @@ static uint64_t clipHash(NSString *t) {
     double _captureMsTotal;
     double _encodeMsTotal;
     double _sendMsTotal;
+    BOOL _audioRequested;
+    BOOL _blackScreen;
 }
 
 + (instancetype)shared {
@@ -200,6 +207,8 @@ static uint64_t clipHash(NSString *t) {
         // keyboard hidden behind a dead session.
         dispatch_async(dispatch_get_main_queue(), ^{ IOSPYSetKeyboardSuppressed(NO); });
         dispatch_async(_captureQueue, ^{ [self stopCapture]; });
+        [self setAudioEnabled:NO];
+        IOSPYSetRemoteBlackScreen(NO);
         _fd = -1;
         close(fd);
         sleep(1);
@@ -264,6 +273,20 @@ static uint64_t clipHash(NSString *t) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 IOSPYInjectTouch((IOSPYTouchPhase)phase, fingerID, x, y);
             });
+        } else if (header.type == IOSPYMsgInputScroll && payload.length >= 28) {
+            const uint8_t *b = (const uint8_t *)payload.bytes;
+            uint8_t phase = b[0];
+            uint8_t momentum = b[1];
+            BOOL precise = b[2] != 0;
+            float values[4];
+            for (int i = 0; i < 4; i++) {
+                uint32_t bits;
+                memcpy(&bits, b + 4 + i * 4, 4);
+                bits = ntohl(bits);
+                memcpy(&values[i], &bits, 4);
+            }
+            IOSPYInjectScroll(phase, momentum, precise,
+                              values[0], values[1], values[2], values[3]);
         } else if (header.type == IOSPYMsgSystemAction && payload.length >= 2) {
             const uint8_t *b = (const uint8_t *)payload.bytes;
             uint16_t action;
@@ -291,8 +314,68 @@ static uint64_t clipHash(NSString *t) {
             // the flag there) and only touched from main, so no races.
             BOOL on = ((const uint8_t *)payload.bytes)[0] != 0;
             dispatch_async(dispatch_get_main_queue(), ^{ IOSPYSetKeyboardSuppressed(on); });
+        } else if (header.type == IOSPYMsgDisplayMode && payload.length >= 1) {
+            BOOL black = ((const uint8_t *)payload.bytes)[0] != 0;
+            _blackScreen = black;
+            if (black) {
+                [self setAudioEnabled:YES];
+            }
+            IOSPYSetRemoteBlackScreen(black);
+            if (!black && !_audioRequested) {
+                [self setAudioEnabled:NO];
+            }
+        } else if (header.type == IOSPYMsgAudioMode && payload.length >= 1) {
+            BOOL enabled = ((const uint8_t *)payload.bytes)[0] != 0;
+            _audioRequested = enabled;
+            [self setAudioEnabled:(enabled || _blackScreen)];
+        } else if (header.type == IOSPYMsgUnlock && payload.length > 0) {
+            NSString *passcode = [[NSString alloc] initWithData:payload
+                                                       encoding:NSUTF8StringEncoding];
+            if (passcode.length > 0) {
+                IOSPYUnlockWithPasscode(passcode);
+            }
+        } else if (header.type == IOSPYMsgPairResult && payload.length > 0) {
+            NSDictionary *pair = [NSJSONSerialization JSONObjectWithData:payload options:0 error:nil];
+            if ([pair[@"hide"] boolValue]) {
+                IOSPYHidePairingCode();
+            } else {
+                NSString *code = [pair[@"code"] isKindOfClass:[NSString class]] ? pair[@"code"] : nil;
+                NSString *hostName = [pair[@"host_name"] isKindOfClass:[NSString class]]
+                    ? pair[@"host_name"] : @"Mac";
+                NSTimeInterval expires = [pair[@"expires_in"] doubleValue];
+                if (code.length == 4) {
+                    IOSPYShowPairingCode(code, hostName, expires > 0 ? expires : 120);
+                }
+            }
         }
       }
+    }
+}
+
+- (void)setAudioEnabled:(BOOL)enabled {
+    if (enabled) {
+        if (!_audioCapture) {
+            _audioCapture = [[IOSPYAudioCapture alloc] init];
+        }
+        if (_audioCapture.isRunning) return;
+        __weak typeof(self) weakSelf = self;
+        [_audioCapture startWithHandler:^(NSData *packet) {
+            typeof(self) selfRef = weakSelf;
+            if (!selfRef || packet.length == 0) return;
+            dispatch_async(selfRef->_sendQueue, ^{
+                int fd = selfRef->_fd;
+                if (fd < 0) return;
+                [selfRef->_socketWriteLock lock];
+                BOOL sent = IOSPYWriteFrame(fd, IOSPYMsgAudioFrame,
+                                             IOSPY_CHANNEL_AUDIO, 0, packet);
+                [selfRef->_socketWriteLock unlock];
+                if (!sent) {
+                    NSLog(@"[ioscpyhook] audio frame send failed");
+                }
+            });
+        }];
+    } else {
+        [_audioCapture stop];
     }
 }
 
@@ -445,16 +528,22 @@ static uint64_t clipHash(NSString *t) {
     }
     _captureTicks++;
     BOOL handled = NO;
-    if (_codec == IOSPY_VIDEO_CODEC_H264) {
-        if ([self captureAndSendH264:fd]) {
+    if (_codec == IOSPY_VIDEO_CODEC_H264 || _codec == IOSPY_VIDEO_CODEC_HEVC) {
+        if ([self captureAndSendVideo:fd]) {
             handled = YES;
         } else {
-            // H.264 isn't usable on this device/OS, so drop to MJPEG for the rest
-            // of the session and keep the screen alive.
+            // Preserve resolution/FPS when HEVC cannot initialize by falling
+            // back to H.264. Only H.264 failure reaches the MJPEG safety path.
             [_encoder invalidate];
             _encoder = nil;
-            _codec = IOSPY_VIDEO_CODEC_MJPEG;
-            NSLog(@"[ioscpyhook] H.264 unavailable; using MJPEG");
+            if (_codec == IOSPY_VIDEO_CODEC_HEVC) {
+                _codec = IOSPY_VIDEO_CODEC_H264;
+                _needKeyframe = YES;
+                NSLog(@"[ioscpyhook] HEVC unavailable; retrying with H.264");
+            } else {
+                _codec = IOSPY_VIDEO_CODEC_MJPEG;
+                NSLog(@"[ioscpyhook] H.264 unavailable; using MJPEG");
+            }
         }
     }
     if (!handled) {
@@ -513,8 +602,8 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     }
 }
 
-- (BOOL)captureAndSendH264:(int)fd {
-    if (!IOSPYH264Available()) {
+- (BOOL)captureAndSendVideo:(int)fd {
+    if (!IOSPYHardwareVideoAvailable(_codec)) {
         return NO;
     }
     // Bound hardware work. A timer tick that arrives while two frames are still
@@ -524,7 +613,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
         return YES;
     }
     if (!_encoder) {
-        _encoder = [[IOSPYH264Encoder alloc] init];
+        _encoder = [[IOSPYVideoEncoder alloc] init];
     }
     int width = 0, height = 0;
     int captureToken = -1;
@@ -540,6 +629,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     _capturedFrames++;
     _captureMsTotal += captureMs;
     int fps = MAX(_config.target_fps, 1);
+    uint8_t submittedCodec = _codec;
     BOOL forceKeyframe = _needKeyframe;
     uint64_t epoch = _encoderEpoch;
     double encodeStart = streamNowMs();
@@ -548,6 +638,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                                        width:width
                                       height:height
                                          fps:fps
+                                       codec:submittedCodec
                                      bitrate:_effectiveBitrate
                             keyframeInterval:MAX(_config.keyframe_interval_frames, 1)
                                forceKeyframe:forceKeyframe
@@ -565,9 +656,13 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
             }
             if (hardError) {
                 self->_droppedFrames++;
-                self->_codec = IOSPY_VIDEO_CODEC_MJPEG;
-                self->_needKeyframe = YES;
-                NSLog(@"[ioscpyhook] asynchronous H.264 encode failed; using MJPEG");
+                if (self->_codec == submittedCodec) {
+                    self->_codec = submittedCodec == IOSPY_VIDEO_CODEC_HEVC
+                        ? IOSPY_VIDEO_CODEC_H264 : IOSPY_VIDEO_CODEC_MJPEG;
+                    self->_needKeyframe = YES;
+                    NSLog(@"[ioscpyhook] asynchronous hardware encode failed; fallback codec=%u",
+                          self->_codec);
+                }
                 return;
             }
             if (avcc.length == 0) {
@@ -593,7 +688,9 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                 return;
             }
             self->_sendBacklog++;
-            uint32_t flags = IOSPY_VIDEO_FLAG_H264 | orientationFlags();
+            uint32_t flags = orientationFlags();
+            flags |= submittedCodec == IOSPY_VIDEO_CODEC_HEVC
+                ? IOSPY_VIDEO_FLAG_HEVC : IOSPY_VIDEO_FLAG_H264;
             if (isKey) {
                 flags |= IOSPY_VIDEO_FLAG_KEYFRAME | IOSPY_VIDEO_FLAG_CONFIG;
             }

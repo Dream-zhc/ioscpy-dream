@@ -6,17 +6,18 @@
 #import <arpa/inet.h>
 #import <limits.h>
 
-BOOL IOSPYH264Available(void) {
+BOOL IOSPYHardwareVideoAvailable(uint8_t codec) {
     // VideoToolbox is present on every device we target; the real gate is whether
     // a session can actually be created, which encodeSurface: reports per-frame
     // (returning nil so the caller falls back to MJPEG). Keep this as the single
     // place to add a stricter probe if a future layout ever needs one.
-    return YES;
+    return codec == 1 || codec == 2;
 }
 
-@implementation IOSPYH264Encoder {
+@implementation IOSPYVideoEncoder {
     VTCompressionSessionRef _session;
     int _w, _h, _fps;
+    uint8_t _codec;
     uint32_t _bitrate;
     int _keyframeInterval;
     int64_t _pts;          // monotonic frame index for presentation timestamps
@@ -30,6 +31,7 @@ BOOL IOSPYH264Available(void) {
         _session = NULL;
     }
     _w = _h = _fps = 0;
+    _codec = 0;
     _bitrate = 0;
     _keyframeInterval = 0;
 }
@@ -55,9 +57,10 @@ BOOL IOSPYH264Available(void) {
 - (BOOL)ensureSessionForWidth:(int)width
                        height:(int)height
                           fps:(int)fps
+                        codec:(uint8_t)codec
                       bitrate:(uint32_t)bitrate
              keyframeInterval:(int)keyframeInterval {
-    if (_session && _w == width && _h == height && _fps == fps && _bitrate == bitrate &&
+    if (_session && _w == width && _h == height && _fps == fps && _codec == codec && _bitrate == bitrate &&
         _keyframeInterval == keyframeInterval) {
         return YES;
     }
@@ -72,8 +75,9 @@ BOOL IOSPYH264Available(void) {
         (id)kCVPixelBufferHeightKey: @(height),
     };
 
+    CMVideoCodecType codecType = codec == 2 ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
     OSStatus s = VTCompressionSessionCreate(kCFAllocatorDefault, width, height,
-                                            kCMVideoCodecType_H264, NULL,
+                                            codecType, NULL,
                                             (__bridge CFDictionaryRef)srcAttrs, NULL,
                                             NULL, NULL, &_session);
     if (s != noErr || !_session) {
@@ -88,7 +92,14 @@ BOOL IOSPYH264Available(void) {
     // Baseline. All supported host decoders use VideoToolbox/OpenH264 and accept
     // it; AutoLevel lets the hardware choose the level required by 120 FPS.
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_H264_High_AutoLevel);
+                         codec == 2 ? kVTProfileLevel_HEVC_Main_AutoLevel
+                                    : kVTProfileLevel_H264_High_AutoLevel);
+    // Quality-first VBR. The bitrate remains a peak/average budget, while this
+    // property keeps text edges and gradients from being sacrificed merely to
+    // minimize encode time.
+    [self setProp:kVTCompressionPropertyKey_Quality real:0.92];
+    CFStringRef speedKey = CFSTR("PrioritizeEncodingSpeedOverQuality");
+    VTSessionSetProperty(_session, speedKey, kCFBooleanFalse);
 
     // Refresh a keyframe at least every few seconds (and bound by frame count) so
     // a host that joins mid-stream recovers quickly.
@@ -110,10 +121,12 @@ BOOL IOSPYH264Available(void) {
     _w = width;
     _h = height;
     _fps = fps;
+    _codec = codec;
     _bitrate = bitrate;
     _keyframeInterval = keyframeInterval;
     _pts = 0;
-    NSLog(@"[ioscpyhook] H.264 session ready %dx%d @%dfps", width, height, fps);
+    NSLog(@"[ioscpyhook] %@ session ready %dx%d @%dfps",
+          codec == 2 ? @"HEVC" : @"H.264", width, height, fps);
     return YES;
 }
 
@@ -128,16 +141,18 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
                  width:(int)width
                 height:(int)height
                    fps:(int)fps
+                 codec:(uint8_t)codec
                bitrate:(uint32_t)bitrate
       keyframeInterval:(int)keyframeInterval
          forceKeyframe:(BOOL)forceKeyframe
-            completion:(IOSPYH264Completion)completion {
+            completion:(IOSPYVideoCompletion)completion {
     if (!surface || width < 2 || height < 2) {
         return NO;
     }
     if (![self ensureSessionForWidth:width
                               height:height
                                  fps:fps
+                               codec:codec
                              bitrate:bitrate
                     keyframeInterval:keyframeInterval]) {
         return NO;
@@ -153,7 +168,7 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
     NSDictionary *frameProps =
         forceKeyframe ? @{(id)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
 
-    IOSPYH264Completion done = [completion copy];
+    IOSPYVideoCompletion done = [completion copy];
 
     OSStatus es = VTCompressionSessionEncodeFrameWithOutputHandler(
         _session, pixelBuffer, pts, kCMTimeInvalid, (__bridge CFDictionaryRef)frameProps, NULL,
@@ -191,21 +206,29 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
                 size_t count = 0, appended = 0;
                 int nalHeaderLen = 0;
                 CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sample);
-                if (fmt &&
-                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                        fmt, 0, NULL, NULL, &count, &nalHeaderLen) == noErr) {
+                OSStatus psStatus = fmt ? (codec == 2
+                    ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                          fmt, 0, NULL, NULL, &count, &nalHeaderLen)
+                    : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                          fmt, 0, NULL, NULL, &count, &nalHeaderLen)) : -1;
+                if (fmt && psStatus == noErr) {
                     for (size_t i = 0; i < count; i++) {
                         const uint8_t *ps = NULL;
                         size_t psLen = 0;
-                        if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                                fmt, i, &ps, &psLen, NULL, NULL) == noErr && ps) {
+                        OSStatus oneStatus = codec == 2
+                            ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                                  fmt, i, &ps, &psLen, NULL, NULL)
+                            : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                                  fmt, i, &ps, &psLen, NULL, NULL);
+                        if (oneStatus == noErr && ps) {
                             appendAVCC(out, ps, psLen);
                             appended++;
                         }
                     }
                 }
                 if (count == 0 || appended != count) {
-                    NSLog(@"[ioscpyhook] incomplete H.264 parameter sets; retrying keyframe");
+                    NSLog(@"[ioscpyhook] incomplete %@ parameter sets; retrying keyframe",
+                          codec == 2 ? @"HEVC" : @"H.264");
                     if (done) done([NSData data], NO, NO);
                     return;
                 }
@@ -230,7 +253,8 @@ static void appendAVCC(NSMutableData *dst, const uint8_t *nal, size_t len) {
     CVPixelBufferRelease(pixelBuffer);
 
     if (es != noErr) {
-        NSLog(@"[ioscpyhook] H.264 encode enqueue failed (%d)", (int)es);
+        NSLog(@"[ioscpyhook] %@ encode enqueue failed (%d)",
+              codec == 2 ? @"HEVC" : @"H.264", (int)es);
         return NO;
     }
     return YES;

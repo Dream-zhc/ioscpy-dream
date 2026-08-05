@@ -37,7 +37,7 @@ IOSPYStreamConfig IOSPYParseStreamConfig(NSData *payload) {
         return config;
     }
     const uint8_t *b = (const uint8_t *)payload.bytes;
-    if (b[1] != IOSPY_STREAM_CONFIG_VERSION) {
+    if (b[1] != 1 && b[1] != IOSPY_STREAM_CONFIG_VERSION) {
         return config;
     }
 

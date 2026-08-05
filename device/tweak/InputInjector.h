@@ -20,6 +20,12 @@ extern "C" {
 // foreground application ultimately consumed the event.
 BOOL IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y);
 
+// Convert AppKit wheel/trackpad deltas into a continuously sampled synthetic
+// pan gesture. The internal 120 Hz integrator smooths coarse mouse-wheel
+// notches and preserves trackpad momentum without requiring the user to drag.
+void IOSPYInjectScroll(uint8_t phase, uint8_t momentumPhase, BOOL precise,
+                       float deltaX, float deltaY, float x, float y);
+
 // Initialize HID routing and the physical-touch sender monitor when SpringBoard
 // loads the tweak, before the first remote input arrives.
 void IOSPYInputInit(void);
@@ -39,6 +45,11 @@ void IOSPYTypeText(NSString *text);
 // 1=Enter 2=Backspace 3=Tab 4=Escape 5=Left 6=Right 7=Up 8=Down,
 // 10=SelectAll 11=Copy 12=Paste 13=Cut 14=Undo).
 void IOSPYKeyAction(uint8_t code);
+
+// Wake and enter a numeric passcode only when SpringBoard reports that the UI is
+// locked. It never types into a foreground application and never bypasses the
+// system passcode check.
+void IOSPYUnlockWithPasscode(NSString *passcode);
 
 // Begin tracking the foreground app's orientation (polled on the main thread).
 void IOSPYOrientationStart(void);
