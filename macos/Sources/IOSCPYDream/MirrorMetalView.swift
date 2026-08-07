@@ -58,6 +58,7 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
     var onScroll: ((Data) -> Void)?
     var onText: ((String) -> Void)?
     var onKey: ((UInt8) -> Void)?
+    var onHomeGesture: (() -> Void)?
     var onFramePresented: (() -> Void)?
     var onPointerActivity: (() -> Void)?
 
@@ -68,6 +69,8 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
     private var colorSpace = CGColorSpaceCreateDeviceRGB()
     private var marked = NSMutableAttributedString()
     private var selection = NSRange(location: 0, length: 0)
+    private var homeSwipeStart: (x: Float, y: Float)?
+    private var homeSwipeTriggered = false
 
     init(frame frameRect: NSRect, device: MTLDevice?, mailbox: VideoFrameMailbox) {
         self.mailbox = mailbox
@@ -154,17 +157,41 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         let point = normalizedPoint(event)
+        homeSwipeStart = point.y >= 0.965 ? point : nil
+        homeSwipeTriggered = false
+        // The physical Home-indicator area belongs to SpringBoard's system
+        // gesture arena, not the foreground app. Reserve it here as well so the
+        // app does not receive a stray touch before we decide this is Home.
+        if homeSwipeStart != nil { return }
         onTouch?(0, point.x, point.y)
     }
 
     override func mouseDragged(with event: NSEvent) {
         let point = normalizedPoint(event)
+        if !homeSwipeTriggered, let start = homeSwipeStart {
+            let upward = start.y - point.y
+            let horizontal = abs(point.x - start.x)
+            // Mirror the iPhone Home-indicator gesture. IOHID injection does not
+            // always enter SpringBoard's system-gesture arena, so a deliberate
+            // upward swipe that begins on the bottom indicator is promoted to
+            // the same Home action. Keep the start zone narrow so ordinary app
+            // scrolling near the bottom remains untouched.
+            if upward >= 0.105, horizontal <= 0.28 {
+                homeSwipeTriggered = true
+                onHomeGesture?()
+            }
+            return
+        }
         onTouch?(1, point.x, point.y)
     }
 
     override func mouseUp(with event: NSEvent) {
         let point = normalizedPoint(event)
-        onTouch?(2, point.x, point.y)
+        if homeSwipeStart == nil {
+            onTouch?(2, point.x, point.y)
+        }
+        homeSwipeStart = nil
+        homeSwipeTriggered = false
     }
 
     override func scrollWheel(with event: NSEvent) {

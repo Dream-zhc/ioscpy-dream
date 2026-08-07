@@ -92,8 +92,15 @@ BOOL IOSPYHardwareVideoAvailable(uint8_t codec) {
     // VideoToolbox to retain another 4-6 frames internally created a second,
     // invisible queue and made glass-to-glass latency vary dramatically under
     // transient load. Keep the encoder's own reorder/delay queue minimal.
-    [self setProp:kVTCompressionPropertyKey_MaxFrameDelayCount
-           number:(fps >= 90 ? 1 : 2)];
+    // One-frame delay was extremely responsive but left too little scheduling
+    // slack for native-resolution 120 FPS when the hardware encoder had a brief
+    // service-time spike. Two frames is still only ~16.7 ms at 120 Hz, while it
+    // avoids throughput oscillation between a full pipeline and starvation.
+    [self setProp:kVTCompressionPropertyKey_MaxFrameDelayCount number:2];
+    // These newer hints are passed by their stable VideoToolbox property names
+    // so the iOS 16 deployment target remains buildable. Unsupported builds just
+    // ignore them (best-effort VTSessionSetProperty behavior).
+    [self setProp:CFSTR("SuggestedLookAheadFrameCount") number:0];
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_MaximizePowerEfficiency,
                          kCFBooleanFalse);
     // High profile gives screen text and gradients better quality per bit than
@@ -120,6 +127,7 @@ BOOL IOSPYHardwareVideoAvailable(uint8_t codec) {
     [self setProp:kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration
              real:(double)keyframeInterval / MAX(fps, 1)];
     [self setProp:kVTCompressionPropertyKey_ExpectedFrameRate number:fps];
+    [self setProp:CFSTR("MaximumRealTimeFrameRate") number:fps];
 
     // Cap bandwidth well under the MJPEG path; screen content stays far below it.
     int avgBitrate = (int)MIN(bitrate, (uint32_t)INT_MAX);

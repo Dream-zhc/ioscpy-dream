@@ -213,21 +213,43 @@ final class AppModel: ObservableObject {
                 self.stats.captureMs = (object["capture_ms_avg"] as? NSNumber)?.doubleValue ?? 0
                 self.stats.encodeMs = (object["encode_ms_avg"] as? NSNumber)?.doubleValue ?? 0
                 self.stats.sendMs = (object["send_ms_avg"] as? NSNumber)?.doubleValue ?? 0
+                self.stats.captureMsMax = (object["capture_ms_max"] as? NSNumber)?.doubleValue ?? 0
+                self.stats.encodeMsMax = (object["encode_ms_max"] as? NSNumber)?.doubleValue ?? 0
+                self.stats.sendMsMax = (object["send_ms_max"] as? NSNumber)?.doubleValue ?? 0
+                self.stats.captureGapMsMax = (object["capture_gap_ms_max"] as? NSNumber)?.doubleValue ?? 0
                 self.stats.effectiveDimension = (object["max_dimension"] as? NSNumber)?.intValue ?? 0
                 self.stats.encodeInFlight = (object["encode_inflight"] as? NSNumber)?.intValue ?? 0
                 self.stats.sendBacklog = (object["send_backlog"] as? NSNumber)?.intValue ?? 0
+                self.stats.encodeInFlightMax = (object["encode_inflight_max"] as? NSNumber)?.intValue ?? 0
+                self.stats.sendBacklogMax = (object["send_backlog_max"] as? NSNumber)?.intValue ?? 0
+                self.stats.dropCapturePressure = (object["drop_capture_pressure"] as? NSNumber)?.uint64Value ?? 0
+                self.stats.dropEncoderPressure = (object["drop_encoder_pressure"] as? NSNumber)?.uint64Value ?? 0
+                self.stats.dropSendPressure = (object["drop_send_pressure"] as? NSNumber)?.uint64Value ?? 0
+                self.stats.dropTransport = (object["drop_transport"] as? NSNumber)?.uint64Value ?? 0
+                self.stats.dropReferenceChain = (object["drop_reference_chain"] as? NSNumber)?.uint64Value ?? 0
 
                 if self.stats.sourceFPS > 0, self.stats.sourceFPS < 90 {
                     NSLog(
-                        "[ioscpy] pipeline cap=%.1f encode=%.1f sent=%.1f capture=%.2fms encode=%.2fms send=%.2fms inFlight=%d backlog=%d max=%d",
+                        "[ioscpy] pipeline cap=%.1f encode=%.1f sent=%.1f capture=%.2f/%.2fms encode=%.2f/%.2fms send=%.2f/%.2fms gapMax=%.2f inFlight=%d/%d backlog=%d/%d drops[c=%llu e=%llu s=%llu t=%llu r=%llu] max=%d",
                         self.stats.captureFPS,
                         self.stats.encodeFPS,
                         self.stats.sourceFPS,
                         self.stats.captureMs,
+                        self.stats.captureMsMax,
                         self.stats.encodeMs,
+                        self.stats.encodeMsMax,
                         self.stats.sendMs,
+                        self.stats.sendMsMax,
+                        self.stats.captureGapMsMax,
                         self.stats.encodeInFlight,
+                        self.stats.encodeInFlightMax,
                         self.stats.sendBacklog,
+                        self.stats.sendBacklogMax,
+                        self.stats.dropCapturePressure,
+                        self.stats.dropEncoderPressure,
+                        self.stats.dropSendPressure,
+                        self.stats.dropTransport,
+                        self.stats.dropReferenceChain,
                         self.stats.effectiveDimension
                     )
                 }
@@ -237,6 +259,28 @@ final class AppModel: ObservableObject {
         connected.onAudio = { [weak self] packet in self?.audioPlayer.enqueue(packet) }
         connected.onRTT = { [weak self] value in
             Task { @MainActor [weak self] in self?.stats.latencyMs = value }
+        }
+        connected.onLANVideoTelemetry = { [weak self] sample in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.stats.lanPacketsPerSecond = sample.packetsPerSecond
+                self.stats.lanRecoveredFrames = sample.recoveredFrames
+                self.stats.lanLostFrames = sample.lostFrames
+                self.stats.lanLateFrames = sample.lateFrames
+                self.stats.lanFrameReceiveMs = sample.frameReceiveMsAverage
+                self.stats.lanFrameReceiveMsMax = sample.frameReceiveMsMax
+                if sample.lostFrames > 0 || sample.lateFrames > 0 {
+                    NSLog(
+                        "[ioscpy] LAN UDP %.0f pkt/s recovered=%llu lost=%llu late=%llu frameRx=%.2f/%.2fms",
+                        sample.packetsPerSecond,
+                        sample.recoveredFrames,
+                        sample.lostFrames,
+                        sample.lateFrames,
+                        sample.frameReceiveMsAverage,
+                        sample.frameReceiveMsMax
+                    )
+                }
+            }
         }
         connected.onDisconnected = { [weak self, weak connected] error in
             Task { @MainActor [weak self] in
@@ -328,6 +372,7 @@ final class AppModel: ObservableObject {
         view.onScroll = { [weak self] payload in self?.session?.sendScroll(payload) }
         view.onText = { [weak self] text in self?.session?.sendText(text) }
         view.onKey = { [weak self] code in self?.session?.sendKey(code) }
+        view.onHomeGesture = { [weak self] in self?.session?.systemAction(1) }
         view.onPointerActivity = { [weak self] in Task { @MainActor in self?.revealToolbar() } }
         let counters = performanceCounters
         view.onFramePresented = { counters.recordPresented() }

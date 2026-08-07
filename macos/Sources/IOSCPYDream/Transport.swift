@@ -16,6 +16,10 @@ final class TCPTransport: @unchecked Sendable {
             throw ConnectionFailure.invalidAddress
         }
         let parameters = NWParameters.tcp
+        // This socket carries only interactive control/input once LAN video is
+        // split to UDP. Mark it as responsive user data so macOS and compatible
+        // Wi-Fi networks do not schedule a drag event like bulk traffic.
+        parameters.serviceClass = .responsiveData
         if let tcp = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
             tcp.noDelay = true
             tcp.connectionTimeout = 8
@@ -248,6 +252,7 @@ final class IOSCPYSession: @unchecked Sendable {
     let profileID: String
     private let transport: TCPTransport
     private let usbForward: USBForward?
+    private let lanVideoReceiver: LANVideoReceiver?
     private let sendLock = NSLock()
     private let realtimeSendQueue = DispatchQueue(
         label: "com.ioscpy.realtime-control",
@@ -255,6 +260,7 @@ final class IOSCPYSession: @unchecked Sendable {
     )
     private var readTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
+    private var lanMediaWatchdogTask: Task<Void, Never>?
     private var stopped = false
     private var sequence: UInt64 = 1
     private let inputStateLock = NSLock()
@@ -272,6 +278,7 @@ final class IOSCPYSession: @unchecked Sendable {
     var onAudio: (@Sendable (Data) -> Void)?
     var onStats: (@Sendable (Data) -> Void)?
     var onRTT: (@Sendable (Double) -> Void)?
+    var onLANVideoTelemetry: (@Sendable (LANVideoTelemetry) -> Void)?
     var onLog: (@Sendable (String) -> Void)?
     var onDisconnected: (@Sendable (Error?) -> Void)?
 
@@ -280,6 +287,7 @@ final class IOSCPYSession: @unchecked Sendable {
         profileID: String,
         transport: TCPTransport,
         usbForward: USBForward?,
+        lanVideoReceiver: LANVideoReceiver?,
         capabilities: Capabilities,
         issuedPairToken: String?,
         pairExpiresAt: Date?
@@ -288,6 +296,7 @@ final class IOSCPYSession: @unchecked Sendable {
         self.profileID = profileID
         self.transport = transport
         self.usbForward = usbForward
+        self.lanVideoReceiver = lanVideoReceiver
         self.capabilities = capabilities
         self.issuedPairToken = issuedPairToken
         self.pairExpiresAt = pairExpiresAt
@@ -328,7 +337,7 @@ final class IOSCPYSession: @unchecked Sendable {
             } catch {
                 if mode == .lan {
                     throw ConnectionFailure.processFailed(
-                        "无法连接 \(host):\(port)。请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.4 手机端。系统错误：\(error.localizedDescription)"
+                        "无法连接 \(host):\(port)。请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.5 手机端。系统错误：\(error.localizedDescription)"
                     )
                 }
                 throw error
@@ -359,19 +368,48 @@ final class IOSCPYSession: @unchecked Sendable {
                 throw ConnectionFailure.protocolError("协议版本不一致：Mac \(Wire.version)，iPhone \(ack.protocolVersion)")
             }
             try await transport.send(makeWireFrame(type: .authenticate, payload: Data(ack.sessionToken.utf8)))
-            return IOSCPYSession(
+
+            let lanVideoReceiver: LANVideoReceiver?
+            if mode == .lan {
+                let receiver = try LANVideoReceiver()
+                receiver.start()
+                try await transport.send(makeWireFrame(
+                    type: .mediaBind,
+                    payload: receiver.mediaBindPayload()
+                ))
+                lanVideoReceiver = receiver
+            } else {
+                lanVideoReceiver = nil
+            }
+
+            let session = IOSCPYSession(
                 mode: mode,
                 profileID: profile.id,
                 transport: transport,
                 usbForward: forward,
+                lanVideoReceiver: lanVideoReceiver,
                 capabilities: ack.capabilities,
                 issuedPairToken: ack.pairToken,
                 pairExpiresAt: ack.pairExpiresAt
             )
+            session.installLANVideoCallbacks()
+            return session
         } catch {
             transport.cancel()
             forward?.stop()
             throw error
+        }
+    }
+
+    private func installLANVideoCallbacks() {
+        lanVideoReceiver?.onVideo = { [weak self] packet in
+            self?.onVideo?(packet)
+        }
+        lanVideoReceiver?.onFrameLoss = { [weak self] in
+            self?.requestKeyframe()
+        }
+        lanVideoReceiver?.onTelemetry = { [weak self] telemetry in
+            self?.onLANVideoTelemetry?(telemetry)
         }
     }
 
@@ -412,6 +450,30 @@ final class IOSCPYSession: @unchecked Sendable {
                 var sentAt = DispatchTime.now().uptimeNanoseconds.bigEndian
                 let payload = Swift.withUnsafeBytes(of: &sentAt) { Data($0) }
                 try? await self.send(type: .ping, payload: payload)
+            }
+        }
+        if let receiver = lanVideoReceiver {
+            lanMediaWatchdogTask = Task.detached(priority: .utility) { [weak self, weak receiver] in
+                let startedAt = DispatchTime.now().uptimeNanoseconds
+                while let self, let receiver, !Task.isCancelled, !self.stopped {
+                    try? await Task.sleep(for: .milliseconds(350))
+                    guard !Task.isCancelled, !self.stopped else { return }
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    let startupSeconds = Double(now &- startedAt) / 1_000_000_000
+                    let stalled = receiver.secondsSinceLastDeliveredFrame().map { $0 > 1.5 } ?? false
+                    let neverStarted = startupSeconds > 1.2 && !receiver.hasDeliveredFrame()
+                    guard stalled || neverStarted else { continue }
+
+                    // Some firewalls/APs may reject or later interrupt UDP. A
+                    // permanent frozen mirror is worse than falling back to the
+                    // older TCP media path, so degrade transport—not quality—once
+                    // the low-latency channel has been silent for a sustained
+                    // interval. The next reconnect will try UDP again.
+                    try? await self.send(type: .mediaBind, payload: Data(repeating: 0, count: 12))
+                    receiver.stop()
+                    self.onLog?("LAN UDP video stalled; fell back to TCP media until reconnect")
+                    return
+                }
             }
         }
     }
@@ -662,10 +724,12 @@ final class IOSCPYSession: @unchecked Sendable {
         stopped = true
         readTask?.cancel()
         pingTask?.cancel()
+        lanMediaWatchdogTask?.cancel()
         discardPendingTouchMove()
         discardPendingScroll()
         Task { try? await send(type: .stopStream) }
         transport.cancel()
+        lanVideoReceiver?.stop()
         usbForward?.stop()
     }
 }

@@ -33,4 +33,11 @@
 // the video pump.
 - (void)setHostFd:(int)fd writeLock:(NSLock *)lock;
 
+// LAN media path. Control/input remain on the authenticated TCP socket while
+// encoded video is sent as small UDP datagrams to avoid TCP head-of-line stalls.
+// Passing port 0 clears the destination and restores the normal TCP video path.
+- (void)setLANVideoPeerAddress:(uint32_t)addressNetworkOrder
+                           port:(uint16_t)portHostOrder
+                          token:(uint64_t)token;
+
 @end

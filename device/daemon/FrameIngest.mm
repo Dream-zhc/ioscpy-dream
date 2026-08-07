@@ -3,11 +3,37 @@
 #import "Protocol.h"
 
 #import <sys/socket.h>
+#import <sys/uio.h>
 #import <netinet/in.h>
+#import <netinet/ip.h>
 #import <netinet/tcp.h>
 #import <arpa/inet.h>
+#import <fcntl.h>
 #import <unistd.h>
 #import <errno.h>
+
+static const uint32_t kIOSPYLANVideoMagic = 0x49554450u; // "IUDP"
+static const uint8_t kIOSPYLANVideoVersion = 1;
+static const uint8_t kIOSPYLANVideoParityFlag = 0x01;
+// Standard IPv4 LAN MTU is 1500. 1400 data + 32 app + 28 UDP/IP = 1460,
+// avoiding IP fragmentation while keeping packet rate lower at 120 FPS.
+static const size_t kIOSPYLANVideoFragmentPayload = 1400;
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t flags;
+    uint16_t headerSize;
+    uint64_t token;
+    uint32_t frameSequence;
+    uint32_t frameLength;
+    uint16_t fragmentIndex;
+    uint16_t fragmentCount;
+    uint16_t payloadLength;
+    uint16_t reserved;
+} IOSPYLANVideoHeader;
+
+static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 32 bytes");
 
 @implementation IOSPYFrameIngest {
     uint16_t _port;
@@ -17,6 +43,11 @@
     int _hostFd;        // the control server's host socket, -1 when none
     NSLock *_hostLock;  // the control server's per-connection write lock
     BOOL _videoReliable; // YES while an inter-frame H.264/HEVC stream is active
+    int _udpFd;
+    struct sockaddr_in _udpPeer;
+    uint64_t _udpToken;
+    uint32_t _udpFrameSequence;
+    NSLock *_udpLock;
 }
 
 + (instancetype)shared {
@@ -34,8 +65,146 @@
         _tweakFd = -1;
         _writeLock = [[NSLock alloc] init];
         _hostFd = -1;
+        _udpFd = -1;
+        _udpLock = [[NSLock alloc] init];
     }
     return self;
+}
+
+- (void)setLANVideoPeerAddress:(uint32_t)addressNetworkOrder
+                           port:(uint16_t)portHostOrder
+                          token:(uint64_t)token {
+    [_udpLock lock];
+    if (_udpFd >= 0) {
+        close(_udpFd);
+        _udpFd = -1;
+    }
+    memset(&_udpPeer, 0, sizeof(_udpPeer));
+    _udpToken = 0;
+    _udpFrameSequence = 0;
+    if (portHostOrder > 0 && token != 0) {
+        int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd >= 0) {
+            int flags = fcntl(fd, F_GETFL, 0);
+            if (flags >= 0) {
+                fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            }
+            int sndbuf = 2 * 1024 * 1024;
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+#if defined(SO_NET_SERVICE_TYPE) && defined(NET_SERVICE_TYPE_VI)
+            int serviceType = NET_SERVICE_TYPE_VI;
+            setsockopt(fd, SOL_SOCKET, SO_NET_SERVICE_TYPE, &serviceType, sizeof(serviceType));
+#endif
+            int tos = IPTOS_LOWDELAY;
+            setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+            _udpPeer.sin_family = AF_INET;
+            _udpPeer.sin_addr.s_addr = addressNetworkOrder;
+            _udpPeer.sin_port = htons(portHostOrder);
+            _udpToken = token;
+            _udpFd = fd;
+            NSLog(@"[ioscpyd] LAN video UDP bound to %@:%u",
+                  [NSString stringWithUTF8String:inet_ntoa(_udpPeer.sin_addr)],
+                  portHostOrder);
+        }
+    }
+    [_udpLock unlock];
+}
+
+- (BOOL)hasLANVideoPeer {
+    [_udpLock lock];
+    BOOL active = _udpFd >= 0 && _udpToken != 0;
+    [_udpLock unlock];
+    return active;
+}
+
+- (BOOL)sendLANVideoFrame:(NSData *)frame {
+    if (frame.length == 0 || frame.length > UINT32_MAX) {
+        return NO;
+    }
+    [_udpLock lock];
+    if (_udpFd < 0 || _udpToken == 0) {
+        [_udpLock unlock];
+        return NO;
+    }
+
+    const uint8_t *bytes = (const uint8_t *)frame.bytes;
+    size_t frameLength = frame.length;
+    size_t fragmentCountSize =
+        (frameLength + kIOSPYLANVideoFragmentPayload - 1) / kIOSPYLANVideoFragmentPayload;
+    if (fragmentCountSize == 0 || fragmentCountSize > UINT16_MAX) {
+        [_udpLock unlock];
+        return NO;
+    }
+    uint16_t fragmentCount = (uint16_t)fragmentCountSize;
+    uint32_t sequence = ++_udpFrameSequence;
+    uint8_t parity[kIOSPYLANVideoFragmentPayload] = {};
+    int localSendFailures = 0;
+
+    for (uint16_t index = 0; index < fragmentCount; index++) {
+        size_t offset = (size_t)index * kIOSPYLANVideoFragmentPayload;
+        size_t length = MIN(kIOSPYLANVideoFragmentPayload, frameLength - offset);
+        for (size_t i = 0; i < length; i++) {
+            parity[i] ^= bytes[offset + i];
+        }
+
+        IOSPYLANVideoHeader header = {};
+        header.magic = htonl(kIOSPYLANVideoMagic);
+        header.version = kIOSPYLANVideoVersion;
+        header.flags = 0;
+        header.headerSize = htons((uint16_t)sizeof(header));
+        header.token = CFSwapInt64HostToBig(_udpToken);
+        header.frameSequence = htonl(sequence);
+        header.frameLength = htonl((uint32_t)frameLength);
+        header.fragmentIndex = htons(index);
+        header.fragmentCount = htons(fragmentCount);
+        header.payloadLength = htons((uint16_t)length);
+
+        struct iovec iov[2] = {
+            {&header, sizeof(header)},
+            {(void *)(bytes + offset), length},
+        };
+        struct msghdr message = {};
+        message.msg_name = &_udpPeer;
+        message.msg_namelen = sizeof(_udpPeer);
+        message.msg_iov = iov;
+        message.msg_iovlen = 2;
+        ssize_t sent = sendmsg(_udpFd, &message, MSG_DONTWAIT);
+        if (sent < 0) {
+            localSendFailures++;
+        }
+    }
+
+    // One parity packet repairs any single missing data fragment in this frame.
+    // This avoids an IDR storm from tiny Wi-Fi loss without introducing a jitter
+    // buffer or retransmission delay.
+    IOSPYLANVideoHeader parityHeader = {};
+    parityHeader.magic = htonl(kIOSPYLANVideoMagic);
+    parityHeader.version = kIOSPYLANVideoVersion;
+    parityHeader.flags = kIOSPYLANVideoParityFlag;
+    parityHeader.headerSize = htons((uint16_t)sizeof(parityHeader));
+    parityHeader.token = CFSwapInt64HostToBig(_udpToken);
+    parityHeader.frameSequence = htonl(sequence);
+    parityHeader.frameLength = htonl((uint32_t)frameLength);
+    parityHeader.fragmentIndex = htons(fragmentCount);
+    parityHeader.fragmentCount = htons(fragmentCount);
+    parityHeader.payloadLength = htons((uint16_t)sizeof(parity));
+    struct iovec parityIov[2] = {
+        {&parityHeader, sizeof(parityHeader)},
+        {parity, sizeof(parity)},
+    };
+    struct msghdr parityMessage = {};
+    parityMessage.msg_name = &_udpPeer;
+    parityMessage.msg_namelen = sizeof(_udpPeer);
+    parityMessage.msg_iov = parityIov;
+    parityMessage.msg_iovlen = 2;
+    if (sendmsg(_udpFd, &parityMessage, MSG_DONTWAIT) < 0) {
+        localSendFailures++;
+    }
+
+    [_udpLock unlock];
+    // A single failed data datagram is still repairable if parity was sent. Two
+    // or more local failures make this frame unrecoverable.
+    return localSendFailures <= 1;
 }
 
 - (void)setHostFd:(int)fd writeLock:(NSLock *)lock {
@@ -119,6 +288,17 @@
                 break;
             }
             if (header.type == IOSPYMsgVideoFrame && payload.length > 0) {
+                if ([self hasLANVideoPeer]) {
+                    // LAN media is intentionally unreliable/latest-first. Never
+                    // fall back to the control TCP stream after a UDP send miss:
+                    // doing so would reintroduce head-of-line stalls exactly when
+                    // Wi-Fi is under pressure. The Mac requests a fresh IDR when
+                    // it detects an unrecoverable sequence gap.
+                    if (![self sendLANVideoFrame:payload]) {
+                        [self sendToTweak:IOSPYMsgRequestKeyframe];
+                    }
+                    continue;
+                }
                 BOOL reliable;
                 @synchronized(self) {
                     reliable = _videoReliable;

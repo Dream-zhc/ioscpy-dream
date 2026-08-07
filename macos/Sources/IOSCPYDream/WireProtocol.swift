@@ -51,6 +51,7 @@ enum MessageType: UInt16 {
     case log = 71
     case stats = 72
     case audioFrame = 73
+    case mediaBind = 74
 }
 
 struct WireFrame {
@@ -63,7 +64,7 @@ struct WireFrame {
 
 struct HelloPayload: Encodable {
     let role = "host"
-    let hostVersion = "0.3.0-dream.4"
+    let hostVersion = "0.3.0-dream.5"
     let protocolVersion = Wire.version
     let nonce: String
     let hostID: String

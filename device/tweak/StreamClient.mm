@@ -79,9 +79,21 @@ static uint64_t clipHash(NSString *t) {
     uint64_t _encodedFrames;
     uint64_t _sentFrames;
     uint64_t _droppedFrames;
+    uint64_t _dropCapturePressure;
+    uint64_t _dropEncoderPressure;
+    uint64_t _dropSendPressure;
+    uint64_t _dropTransport;
+    uint64_t _dropReferenceChain;
     double _captureMsTotal;
     double _encodeMsTotal;
     double _sendMsTotal;
+    double _captureMsMax;
+    double _encodeMsMax;
+    double _sendMsMax;
+    double _lastCaptureTickMs;
+    double _captureGapMsMax;
+    NSUInteger _encodeInFlightMax;
+    NSUInteger _sendBacklogMax;
     BOOL _audioRequested;
     BOOL _blackScreen;
 }
@@ -433,9 +445,21 @@ static uint64_t clipHash(NSString *t) {
     _encodedFrames = 0;
     _sentFrames = 0;
     _droppedFrames = 0;
+    _dropCapturePressure = 0;
+    _dropEncoderPressure = 0;
+    _dropSendPressure = 0;
+    _dropTransport = 0;
+    _dropReferenceChain = 0;
     _captureMsTotal = 0;
     _encodeMsTotal = 0;
     _sendMsTotal = 0;
+    _captureMsMax = 0;
+    _encodeMsMax = 0;
+    _sendMsMax = 0;
+    _lastCaptureTickMs = 0;
+    _captureGapMsMax = 0;
+    _encodeInFlightMax = 0;
+    _sendBacklogMax = 0;
     _effectiveMaxDimension = _config.max_dimension;
     _effectiveBitrate = _config.bitrate_bps;
     _healthyStatsWindows = 0;
@@ -507,9 +531,20 @@ static uint64_t clipHash(NSString *t) {
         @"encoded_frames": @(_encodedFrames),
         @"sent_frames": @(_sentFrames),
         @"dropped_frames": @(_droppedFrames),
+        @"drop_capture_pressure": @(_dropCapturePressure),
+        @"drop_encoder_pressure": @(_dropEncoderPressure),
+        @"drop_send_pressure": @(_dropSendPressure),
+        @"drop_transport": @(_dropTransport),
+        @"drop_reference_chain": @(_dropReferenceChain),
         @"capture_ms_avg": @(captureAvg),
         @"encode_ms_avg": @(encodeAvg),
         @"send_ms_avg": @(sendAvg),
+        @"capture_ms_max": @(_captureMsMax),
+        @"encode_ms_max": @(_encodeMsMax),
+        @"send_ms_max": @(_sendMsMax),
+        @"capture_gap_ms_max": @(_captureGapMsMax),
+        @"encode_inflight_max": @(_encodeInFlightMax),
+        @"send_backlog_max": @(_sendBacklogMax),
         @"input": IOSPYInputDiagnostics() ?: @{},
     };
     NSData *body = [NSJSONSerialization dataWithJSONObject:stats options:0 error:nil];
@@ -529,9 +564,20 @@ static uint64_t clipHash(NSString *t) {
     _encodedFrames = 0;
     _sentFrames = 0;
     _droppedFrames = 0;
+    _dropCapturePressure = 0;
+    _dropEncoderPressure = 0;
+    _dropSendPressure = 0;
+    _dropTransport = 0;
+    _dropReferenceChain = 0;
     _captureMsTotal = 0;
     _encodeMsTotal = 0;
     _sendMsTotal = 0;
+    _captureMsMax = 0;
+    _encodeMsMax = 0;
+    _sendMsMax = 0;
+    _captureGapMsMax = 0;
+    _encodeInFlightMax = _h264InFlight;
+    _sendBacklogMax = _sendBacklog;
 }
 
 - (void)captureAndSend {
@@ -539,6 +585,11 @@ static uint64_t clipHash(NSString *t) {
     if (fd < 0) {
         return;
     }
+    double tickNow = streamNowMs();
+    if (_lastCaptureTickMs > 0) {
+        _captureGapMsMax = MAX(_captureGapMsMax, tickNow - _lastCaptureTickMs);
+    }
+    _lastCaptureTickMs = tickNow;
     _captureTicks++;
     BOOL handled = NO;
     if (_codec == IOSPY_VIDEO_CODEC_H264 || _codec == IOSPY_VIDEO_CODEC_HEVC) {
@@ -624,6 +675,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     // visible latency ramp that takes seconds to drain.
     if (_sendBacklog >= 2) {
         _droppedFrames++;
+        _dropSendPressure++;
         return YES;
     }
     // Compression latency is not the same as throughput. At 2160p the hardware
@@ -634,6 +686,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                              (_config.target_fps >= 80 ? 5 : 4);
     if (_h264InFlight >= maxInFlight) {
         _droppedFrames++;
+        _dropEncoderPressure++;
         return YES;
     }
     if (!_encoder) {
@@ -648,16 +701,19 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     if (!surface || width < 2 || height < 2) {
         IOSPYReleaseCaptureSurface(captureToken);
         _droppedFrames++;
+        _dropCapturePressure++;
         return NO;
     }
     _capturedFrames++;
     _captureMsTotal += captureMs;
+    _captureMsMax = MAX(_captureMsMax, captureMs);
     int fps = MAX(_config.target_fps, 1);
     uint8_t submittedCodec = _codec;
     BOOL forceKeyframe = _needKeyframe;
     uint64_t epoch = _encoderEpoch;
     double encodeStart = streamNowMs();
     _h264InFlight++;
+    _encodeInFlightMax = MAX(_encodeInFlightMax, _h264InFlight);
     BOOL submitted = [_encoder submitSurface:surface
                                        width:width
                                       height:height
@@ -699,6 +755,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
 
             self->_encodedFrames++;
             self->_encodeMsTotal += encodeMs;
+            self->_encodeMsMax = MAX(self->_encodeMsMax, encodeMs);
             if (isKey) {
                 self->_needKeyframe = NO;
                 self->_dropUntilKeyframe = NO;
@@ -708,6 +765,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                 // them until the forced IDR is ready instead of showing a burst
                 // of corruption or delayed recovery on the Mac.
                 self->_droppedFrames++;
+                self->_dropReferenceChain++;
                 self->_needKeyframe = YES;
                 return;
             }
@@ -717,11 +775,13 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
             // can recover without replaying stale inter-frames.
             if (self->_sendBacklog >= 2) {
                 self->_droppedFrames++;
+                self->_dropSendPressure++;
                 self->_needKeyframe = YES;
                 self->_dropUntilKeyframe = YES;
                 return;
             }
             self->_sendBacklog++;
+            self->_sendBacklogMax = MAX(self->_sendBacklogMax, self->_sendBacklog);
             uint32_t flags = orientationFlags();
             flags |= submittedCodec == IOSPY_VIDEO_CODEC_HEVC
                 ? IOSPY_VIDEO_FLAG_HEVC : IOSPY_VIDEO_FLAG_H264;
@@ -744,10 +804,12 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                         self->_sendBacklog--;
                     }
                     self->_sendMsTotal += sendMs;
+                    self->_sendMsMax = MAX(self->_sendMsMax, sendMs);
                     if (sent) {
                         self->_sentFrames++;
                     } else {
                         self->_droppedFrames++;
+                        self->_dropTransport++;
                         self->_needKeyframe = YES;
                         self->_dropUntilKeyframe = YES;
                     }

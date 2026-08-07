@@ -299,6 +299,8 @@ struct MirrorView: View {
                     }
                 }
                 .shadow(color: .black.opacity(0.48), radius: 18, y: 8)
+            MirrorEdgeResizeRepresentable()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .background(Color.clear)
@@ -324,7 +326,10 @@ struct MirrorAccessoryBar: View {
     @State private var draggingWindow = false
 
     private var displayedFPS: Double {
-        model.stats.sourceFPS > 0 ? model.stats.sourceFPS : model.stats.receiveFPS
+        // What matters to the user is the complete frame rate that actually
+        // reached the Mac. Device-side source FPS can look perfect while TCP
+        // retransmission or Wi-Fi jitter starves playback.
+        model.stats.receiveFPS > 0 ? model.stats.receiveFPS : model.stats.sourceFPS
     }
 
     var body: some View {
@@ -355,10 +360,28 @@ struct MirrorAccessoryBar: View {
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .foregroundStyle(displayedFPS >= 100 ? Color.green : Color.primary)
                 .frame(minWidth: 53, alignment: .leading)
-                .help(String(format: "%@ · %.1f Mbps · RTT %.1f ms",
+                .help(String(format: "%@ · Mac RX %.1f · device %.1f · %.1f Mbps · RTT %.1f ms\ncapture %.2f/%.2f ms · encode %.2f/%.2f ms · timer gap %.2f ms\ndrops C:%llu E:%llu S:%llu T:%llu R:%llu\nLAN %.0f pkt/s · frame RX %.2f/%.2f ms · FEC %llu · lost %llu · late %llu",
                              model.stats.transport,
+                             model.stats.receiveFPS,
+                             model.stats.sourceFPS,
                              model.stats.bitrateMbps,
-                             model.stats.latencyMs))
+                             model.stats.latencyMs,
+                             model.stats.captureMs,
+                             model.stats.captureMsMax,
+                             model.stats.encodeMs,
+                             model.stats.encodeMsMax,
+                             model.stats.captureGapMsMax,
+                             model.stats.dropCapturePressure,
+                             model.stats.dropEncoderPressure,
+                             model.stats.dropSendPressure,
+                             model.stats.dropTransport,
+                             model.stats.dropReferenceChain,
+                             model.stats.lanPacketsPerSecond,
+                             model.stats.lanFrameReceiveMs,
+                             model.stats.lanFrameReceiveMsMax,
+                             model.stats.lanRecoveredFrames,
+                             model.stats.lanLostFrames,
+                             model.stats.lanLateFrames))
 
             Divider().frame(height: 22).opacity(0.4)
             toolbarButton("house", help: "主屏幕") { model.systemAction(1) }

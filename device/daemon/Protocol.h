@@ -84,6 +84,11 @@ typedef NS_ENUM(uint16_t, IOSPYMessageType) {
     IOSPYMsgLog                  = 71,
     IOSPYMsgStats                = 72,
     IOSPYMsgAudioFrame           = 73,
+    // LAN-only media acceleration. The authenticated host sends
+    // [udp_port:u16][reserved:u16][session_token:u64], all big-endian. Video
+    // then leaves the control TCP stream and is delivered as low-latency UDP
+    // datagrams. USB continues to use the existing reliable stream.
+    IOSPYMsgMediaBind            = 74,
 };
 
 typedef struct {

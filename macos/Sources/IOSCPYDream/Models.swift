@@ -137,9 +137,26 @@ struct RuntimeStats: Equatable {
     var captureMs: Double = 0
     var encodeMs: Double = 0
     var sendMs: Double = 0
+    var captureMsMax: Double = 0
+    var encodeMsMax: Double = 0
+    var sendMsMax: Double = 0
+    var captureGapMsMax: Double = 0
     var effectiveDimension: Int = 0
     var encodeInFlight: Int = 0
     var sendBacklog: Int = 0
+    var encodeInFlightMax: Int = 0
+    var sendBacklogMax: Int = 0
+    var dropCapturePressure: UInt64 = 0
+    var dropEncoderPressure: UInt64 = 0
+    var dropSendPressure: UInt64 = 0
+    var dropTransport: UInt64 = 0
+    var dropReferenceChain: UInt64 = 0
+    var lanPacketsPerSecond: Double = 0
+    var lanRecoveredFrames: UInt64 = 0
+    var lanLostFrames: UInt64 = 0
+    var lanLateFrames: UInt64 = 0
+    var lanFrameReceiveMs: Double = 0
+    var lanFrameReceiveMsMax: Double = 0
     var transport: String = ""
 }
 

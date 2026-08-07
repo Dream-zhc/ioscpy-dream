@@ -39,6 +39,7 @@ never renumbered, and new messages are only appended.
 | LOG                    | 71    | D→H   | control | JSON         |
 | STATS                  | 72    | D→H   | control | JSON         |
 | AUDIO_FRAME            | 73    | D→H   | audio   | binary PCM   |
+| MEDIA_BIND             | 74    | H→D   | control | binary       |
 
 In the `dir` column, H→D denotes host to daemon and D→H denotes daemon to host.
 
@@ -173,6 +174,38 @@ The initial v5 transport uses lossless float PCM for device validation:
 `["APCM":u32][sample_rate:u32][channels:u16][reserved:u16][frames:u32]`, followed
 by interleaved big-endian float32 samples. The Mac drops stale buffered audio
 rather than allowing latency to grow after a stall.
+
+### MEDIA_BIND and LAN video datagrams
+
+After LAN authentication the Mac binds an ephemeral UDP port and sends
+`MEDIA_BIND` with `[udp_port:u16][reserved:u16][session_token:u64]`, all
+big-endian. A zero port/token disables UDP and restores the TCP media fallback.
+USB never uses this message and keeps the established usbmux/TCP path.
+
+LAN encoded video is intentionally separated from the reliable control stream.
+Losing one Wi-Fi packet must not hold later video and input behind TCP
+retransmission. Each encoded `VIDEO_FRAME` body is fragmented into UDP datagrams
+with a 32-byte header and at most 1400 payload bytes (1460 bytes including
+UDP/IPv4 headers, below a standard 1500-byte LAN MTU):
+
+| field          | size | meaning                                      |
+|----------------|------|----------------------------------------------|
+| magic          | 4    | `0x49554450` (`IUDP`)                        |
+| version        | 1    | `1`                                          |
+| flags          | 1    | bit 0 marks XOR parity                       |
+| header size    | 2    | `32`                                         |
+| session token  | 8    | per-LAN-session random token                 |
+| frame sequence | 4    | monotonically increasing encoded frame ID    |
+| frame length   | 4    | total `VIDEO_FRAME` body bytes               |
+| fragment index | 2    | zero-based data fragment index               |
+| fragment count | 2    | number of data fragments                     |
+| payload length | 2    | bytes carried by this datagram               |
+| reserved       | 2    | zero                                          |
+
+One XOR parity datagram is added per frame and can recover one missing data
+fragment. The Mac keeps at most four incomplete frames and expires partial
+assemblies after 35 ms. There is no playback jitter buffer: late frames are
+dropped, and an unrecoverable inter-frame gap requests a fresh IDR immediately.
 
 ## System actions (`SYSTEM_ACTION` payload, u16 big-endian)
 

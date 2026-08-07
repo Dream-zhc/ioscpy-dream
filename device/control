@@ -1,6 +1,6 @@
 Package: com.ioscpy.device
 Name: ioscpy dream
-Version: 0.3.0~dream.4
+Version: 0.3.0~dream.5
 Architecture: iphoneos-arm
 Description: Mirror and control this device from the native macOS app over USB or LAN.
 Maintainer: Lautaro Villarreal Culic' <lautaro@lautarovculic.com>

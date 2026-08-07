@@ -9,7 +9,9 @@ release artifacts contain the native app.
 - iPhone 14 Pro, iOS 16.0.2, roothide + ElleKit
 - Apple Silicon Mac, macOS 26
 - one active iPhone session, with multiple saved device profiles
-- USB or same-LAN TCP selected explicitly by the user
+- USB or same-LAN selected explicitly by the user; LAN control stays on TCP and
+  encoded video uses a dedicated low-latency UDP channel with one-fragment XOR
+  recovery and automatic TCP fallback when UDP is unreachable
 
 ## Mac architecture
 
@@ -81,7 +83,7 @@ USB mode currently expects `idevice_id` and `iproxy` from libimobiledevice.
 ## Device validation order
 
 1. Install the rootless package and run `sbreload`.
-2. Confirm `ioscpyctl status` reports protocol 5 and version 0.3.0-dream.4.
+2. Confirm `ioscpyctl status` reports protocol 5 and version 0.3.0-dream.5.
 3. Open the Mac app and validate USB video/input before enabling LAN.
 4. Test Chinese text and precise trackpad scrolling.
 5. Test HEVC 120 FPS and record device/host telemetry.

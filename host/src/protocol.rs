@@ -167,6 +167,7 @@ pub enum MessageType {
     Log = 71,
     Stats = 72,
     AudioFrame = 73,
+    MediaBind = 74,
 }
 
 impl MessageType {
@@ -203,6 +204,7 @@ impl MessageType {
             71 => Log,
             72 => Stats,
             73 => AudioFrame,
+            74 => MediaBind,
             _ => return None,
         })
     }
@@ -684,7 +686,7 @@ mod tests {
     #[test]
     fn message_type_roundtrip() {
         for v in [
-            1u16, 2, 5, 6, 12, 13, 23, 50, 52, 53, 54, 60, 61, 70, 71, 72, 73,
+            1u16, 2, 5, 6, 12, 13, 23, 50, 52, 53, 54, 60, 61, 70, 71, 72, 73, 74,
         ] {
             let mt = MessageType::from_u16(v).unwrap();
             assert_eq!(mt as u16, v);

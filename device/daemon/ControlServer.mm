@@ -14,7 +14,7 @@
 #import <unistd.h>
 #import <errno.h>
 
-NSString *const IOSPYDaemonVersion = @"0.3.0-dream.4";
+NSString *const IOSPYDaemonVersion = @"0.3.0-dream.5";
 static NSString *const IOSPYTrustPath = @"/var/mobile/Library/Preferences/com.ioscpy.trust.plist";
 static const NSTimeInterval IOSPYTrustLifetime = 30.0 * 24.0 * 60.0 * 60.0;
 static const NSTimeInterval IOSPYPairingLifetime = 120.0;
@@ -221,6 +221,37 @@ static const NSTimeInterval IOSPYPairingLifetime = 120.0;
                 }
                 break;
             }
+            case IOSPYMsgMediaBind: {
+                if (!authenticated) {
+                    [writeLock lock];
+                    [self sendError:fd code:@"UNAUTHENTICATED" fatal:NO
+                            message:@"authenticate before binding LAN media"];
+                    [writeLock unlock];
+                    break;
+                }
+                if (!peerIsLoopback && payload.length >= 12) {
+                    const uint8_t *b = (const uint8_t *)payload.bytes;
+                    uint16_t portBE = 0;
+                    uint64_t tokenBE = 0;
+                    memcpy(&portBE, b, sizeof(portBE));
+                    memcpy(&tokenBE, b + 4, sizeof(tokenBE));
+                    uint16_t mediaPort = ntohs(portBE);
+                    uint64_t mediaToken = CFSwapInt64BigToHost(tokenBE);
+                    if (mediaPort > 0 && mediaToken != 0) {
+                        [[IOSPYFrameIngest shared]
+                            setLANVideoPeerAddress:peer.sin_addr.s_addr
+                                              port:mediaPort
+                                             token:mediaToken];
+                        NSLog(@"[ioscpyd] LAN video moved off control TCP to UDP:%u",
+                              mediaPort);
+                    } else {
+                        [[IOSPYFrameIngest shared]
+                            setLANVideoPeerAddress:0 port:0 token:0];
+                        NSLog(@"[ioscpyd] LAN UDP video disabled; using TCP fallback");
+                    }
+                }
+                break;
+            }
             case IOSPYMsgStartStream:
                 if (!streaming) {
                     IOSPYStreamConfig config = IOSPYParseStreamConfig(payload);
@@ -329,6 +360,7 @@ static const NSTimeInterval IOSPYPairingLifetime = 120.0;
     alive = NO;
     streaming = NO;
     [[IOSPYFrameIngest shared] setVideoReliable:NO];
+    [[IOSPYFrameIngest shared] setLANVideoPeerAddress:0 port:0 token:0];
     [[IOSPYFrameIngest shared] setHostFd:-1 writeLock:nil];
     [[IOSPYFrameIngest shared] tellTweakStop];
     // Restore the on-screen keyboard in case this session hid it. Covers an
@@ -509,6 +541,7 @@ static const NSTimeInterval IOSPYPairingLifetime = 120.0;
         @"keyboard": @([[IOSPYFrameIngest shared] tweakConnected]),
         @"orientation": @NO,
         @"lan": @(_lanEnabled),
+        @"lan_video_udp": @YES,
         @"black_screen": @([[IOSPYFrameIngest shared] tweakConnected]),
         @"audio": @([[IOSPYFrameIngest shared] tweakConnected]),
     };
