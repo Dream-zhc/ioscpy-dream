@@ -21,17 +21,13 @@ static const uint8_t kIOSPYLANVideoParityFlag = 0x01;
 // Standard IPv4 LAN MTU is 1500. 1400 data + 32 app + 28 UDP/IP = 1460,
 // avoiding IP fragmentation while keeping packet rate lower at 120 FPS.
 static const size_t kIOSPYLANVideoFragmentPayload = 1400;
-static const size_t kIOSPYLANVideoFECGroup = 12;
-static const size_t kIOSPYLANVideoKeyframeFECGroup = 4;
+// Keep FEC useful without turning 60 Mbps video into a packet-rate amplifier.
+// dream.8 used 12/4 and synchronous userspace pacing. On the target device the
+// pacing waits routinely overslept by tens of milliseconds, blocked the
+// tweak->daemon ingest loop and caused heavy send-pressure drops.
+static const size_t kIOSPYLANVideoFECGroup = 16;
+static const size_t kIOSPYLANVideoKeyframeFECGroup = 8;
 static const NSUInteger kIOSPYUDPTelemetrySamples = 256;
-
-static uint64_t machTicksForNanoseconds(uint64_t nanoseconds) {
-    static mach_timebase_info_data_t info = {};
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ mach_timebase_info(&info); });
-    if (info.numer == 0) return nanoseconds;
-    return (uint64_t)((__uint128_t)nanoseconds * info.denom / info.numer);
-}
 
 static int compareUDPMetricDouble(const void *a, const void *b) {
     double lhs = *(const double *)a;
@@ -192,11 +188,10 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
     size_t fecGroupSize = keyframe ? kIOSPYLANVideoKeyframeFECGroup
                                    : kIOSPYLANVideoFECGroup;
     size_t groupCount = (fragmentCountSize + fecGroupSize - 1) / fecGroupSize;
-    // Spread only multi-group frames. Small P-frames stay effectively zero-latency;
-    // motion frames are smoothed across 6 ms and large IDRs across 12 ms instead
-    // of dumping thousands of datagrams into the Wi-Fi queue in one burst.
-    uint64_t pacingWindowNs = keyframe ? 12ull * NSEC_PER_MSEC : 6ull * NSEC_PER_MSEC;
-    uint64_t pacingStart = mach_absolute_time();
+    // Do not sleep between UDP groups here. This method runs synchronously on
+    // the daemon frame-ingest path; dream.8's mach_wait_until() pacing turned a
+    // nominal 6/12 ms spread into 30-100+ ms frame-send stalls under load,
+    // backpressuring the local tweak socket and collapsing source FPS.
     double pacedWaitMs = 0;
 
     BOOL (^sendDatagram)(uint8_t, uint16_t, uint16_t, const void *, size_t) =
@@ -261,22 +256,6 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
         sendDatagram(kIOSPYLANVideoParityFlag, (uint16_t)groupStart,
                      parityDataCount, parity, sizeof(parity));
 
-        if (group + 1 < groupCount && groupCount > 1) {
-            uint64_t targetNs = pacingWindowNs * (group + 1) / groupCount;
-            uint64_t target = pacingStart + machTicksForNanoseconds(targetNs);
-            uint64_t before = mach_absolute_time();
-            if (target > before) {
-                mach_wait_until(target);
-                uint64_t after = mach_absolute_time();
-                static mach_timebase_info_data_t info = {};
-                static dispatch_once_t once;
-                dispatch_once(&once, ^{ mach_timebase_info(&info); });
-                if (info.denom != 0) {
-                    pacedWaitMs += (double)(after - before) * (double)info.numer /
-                                   (double)info.denom / 1e6;
-                }
-            }
-        }
     }
 
     double sendMs = (CFAbsoluteTimeGetCurrent() - sendStartedAt) * 1000.0;

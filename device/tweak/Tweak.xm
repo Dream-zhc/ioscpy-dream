@@ -58,7 +58,7 @@ static BOOL gSuppressPasteAlert = NO;
 %ctor {
     @autoreleasepool {
         NSString *process = [[NSProcessInfo processInfo] processName];
-        NSLog(@"[ioscpyhook] loaded into %@ (0.3.0-dream.8)", process);
+        NSLog(@"[ioscpyhook] loaded into %@ (0.3.0-dream.9)", process);
 
         // Leave a small breadcrumb others can stat to confirm the hook loaded.
         NSString *dir = @"/var/mobile/Library/Preferences";

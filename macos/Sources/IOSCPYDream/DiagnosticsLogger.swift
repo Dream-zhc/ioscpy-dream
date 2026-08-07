@@ -41,7 +41,7 @@ final class DiagnosticsLogger: @unchecked Sendable {
                 handle = opened
                 activeURL = latestLogURL
                 writeLocked(category: "app_start", fields: [
-                    "release": "0.3.0-dream.8",
+                    "release": "0.3.0-dream.9",
                     "app_version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
                     "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
                     "macos": ProcessInfo.processInfo.operatingSystemVersionString,

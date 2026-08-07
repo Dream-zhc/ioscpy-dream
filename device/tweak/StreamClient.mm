@@ -811,7 +811,10 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     // callback may arrive ~35-45 ms later while still accepting a new frame every
     // 8.3 ms. Two in-flight frames therefore capped throughput near 50 FPS.
     // Keep enough slots to fill the pipeline, but never allow an unbounded queue.
-    NSUInteger maxInFlight = _config.target_fps >= 100 ? 8 :
+    // Seven slots sustain 120 Hz with the measured ~45-50 ms hardware callback
+    // latency while avoiding the extra queue age observed when all eight dream.8
+    // slots filled and callback latency stretched into the 60-70 ms range.
+    NSUInteger maxInFlight = _config.target_fps >= 100 ? 7 :
                              (_config.target_fps >= 80 ? 5 : 4);
     if (_h264InFlight >= maxInFlight) {
         _droppedFrames++;

@@ -373,7 +373,7 @@ final class IOSCPYSession: @unchecked Sendable {
             }
             guard let connectedTransport else {
                 throw ConnectionFailure.processFailed(
-                    "无法连接 \(host):\(port)。已自动等待并重试局域网路径；请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.8 手机端。系统错误：\(lastStartError?.localizedDescription ?? "未知错误")"
+                    "无法连接 \(host):\(port)。已自动等待并重试局域网路径；请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.9 手机端。系统错误：\(lastStartError?.localizedDescription ?? "未知错误")"
                 )
             }
             transport = connectedTransport
@@ -438,7 +438,7 @@ final class IOSCPYSession: @unchecked Sendable {
                 }
                 guard !liveCapabilities.streamBackends.isEmpty else {
                     throw ConnectionFailure.processFailed(
-                        "iPhone 的 SpringBoard 控制桥接尚未就绪。请确认 dream.8 手机端已安装；无需先打开旧版 App，等待几秒后会自动重试。"
+                        "iPhone 的 SpringBoard 控制桥接尚未就绪。请确认 dream.9 手机端已安装；无需先打开旧版 App，等待几秒后会自动重试。"
                     )
                 }
             }

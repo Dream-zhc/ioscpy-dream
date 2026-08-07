@@ -176,7 +176,7 @@ jobs:
 
       - name: Assemble complete archive
         run: |
-          VERSION="0.3.0-dream.8"
+          VERSION="0.3.0-dream.9"
           printf '%s\n' \
             'Install the rootless .deb on the iPhone, run sbreload, then open the macOS app.' \
             'The macOS app is ad-hoc signed only and is not notarized.' \
