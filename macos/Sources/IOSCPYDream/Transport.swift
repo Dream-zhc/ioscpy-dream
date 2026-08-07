@@ -269,6 +269,8 @@ final class IOSCPYSession: @unchecked Sendable {
     private var pendingScroll: Data?
     private var scrollInFlight = false
     private var lastKeyframeRequestNanos: UInt64 = 0
+    private let lanFallbackLock = NSLock()
+    private var lanFallbackActivated = false
 
     let capabilities: Capabilities
     let issuedPairToken: String?
@@ -369,6 +371,39 @@ final class IOSCPYSession: @unchecked Sendable {
             }
             try await transport.send(makeWireFrame(type: .authenticate, payload: Data(ack.sessionToken.utf8)))
 
+            // ioscpyd can be ready a fraction of a second before the SpringBoard
+            // tweak has reattached to its loopback frame channel (notably after
+            // sbreload/reboot). START_STREAM sent during that gap is intentionally
+            // fire-and-forget on the daemon side and would be lost, which made the
+            // new app appear unable to connect until an older client happened to
+            // wake the bridge first. Poll the live capability map before binding
+            // media or starting capture so the first connection is deterministic.
+            var liveCapabilities = ack.capabilities
+            if liveCapabilities.streamBackends.isEmpty {
+                let deadline = ContinuousClock.now + .seconds(5)
+                while ContinuousClock.now < deadline, liveCapabilities.streamBackends.isEmpty {
+                    try await Task.sleep(for: .milliseconds(150))
+                    try await transport.send(makeWireFrame(type: .capabilitiesRequest))
+                    let readiness = try await readFrame(from: transport)
+                    switch readiness.type {
+                    case .capabilitiesResponse:
+                        liveCapabilities = try JSONDecoder().decode(Capabilities.self, from: readiness.payload)
+                    case .error:
+                        let daemonError = try JSONDecoder().decode(DaemonErrorPayload.self, from: readiness.payload)
+                        if daemonError.fatal {
+                            throw ConnectionFailure.protocolError("\(daemonError.code)：\(daemonError.message)")
+                        }
+                    default:
+                        break
+                    }
+                }
+                guard !liveCapabilities.streamBackends.isEmpty else {
+                    throw ConnectionFailure.processFailed(
+                        "iPhone 的 SpringBoard 控制桥接尚未就绪。请确认 dream.6 手机端已安装；无需先打开旧版 App，等待几秒后重试即可。"
+                    )
+                }
+            }
+
             let lanVideoReceiver: LANVideoReceiver?
             if mode == .lan {
                 let receiver = try LANVideoReceiver()
@@ -388,7 +423,7 @@ final class IOSCPYSession: @unchecked Sendable {
                 transport: transport,
                 usbForward: forward,
                 lanVideoReceiver: lanVideoReceiver,
-                capabilities: ack.capabilities,
+                capabilities: liveCapabilities,
                 issuedPairToken: ack.pairToken,
                 pairExpiresAt: ack.pairExpiresAt
             )
@@ -469,9 +504,7 @@ final class IOSCPYSession: @unchecked Sendable {
                     // older TCP media path, so degrade transport—not quality—once
                     // the low-latency channel has been silent for a sustained
                     // interval. The next reconnect will try UDP again.
-                    try? await self.send(type: .mediaBind, payload: Data(repeating: 0, count: 12))
-                    receiver.stop()
-                    self.onLog?("LAN UDP video stalled; fell back to TCP media until reconnect")
+                    self.fallbackLANVideoToTCP(reason: "UDP media watchdog timeout")
                     return
                 }
             }
@@ -659,11 +692,29 @@ final class IOSCPYSession: @unchecked Sendable {
     func requestKeyframe() {
         inputStateLock.lock()
         let now = DispatchTime.now().uptimeNanoseconds
-        let due = now &- lastKeyframeRequestNanos >= 250_000_000
+        let due = now &- lastKeyframeRequestNanos >= 500_000_000
         if due { lastKeyframeRequestNanos = now }
         inputStateLock.unlock()
         guard due else { return }
         enqueue(type: .requestKeyframe)
+    }
+
+    func fallbackLANVideoToTCP(reason: String) {
+        guard mode == .lan, let receiver = lanVideoReceiver else { return }
+        lanFallbackLock.lock()
+        guard !lanFallbackActivated else {
+            lanFallbackLock.unlock()
+            return
+        }
+        lanFallbackActivated = true
+        lanFallbackLock.unlock()
+
+        Task { [weak self, weak receiver] in
+            guard let self else { return }
+            try? await self.send(type: .mediaBind, payload: Data(repeating: 0, count: 12))
+            receiver?.stop()
+            self.onLog?("LAN UDP degraded; using stable TCP video fallback (\(reason))")
+        }
     }
 
     func sendTouch(phase: UInt8, x: Float, y: Float) {

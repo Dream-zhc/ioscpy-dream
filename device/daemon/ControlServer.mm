@@ -14,7 +14,7 @@
 #import <unistd.h>
 #import <errno.h>
 
-NSString *const IOSPYDaemonVersion = @"0.3.0-dream.5";
+NSString *const IOSPYDaemonVersion = @"0.3.0-dream.6";
 static NSString *const IOSPYTrustPath = @"/var/mobile/Library/Preferences/com.ioscpy.trust.plist";
 static const NSTimeInterval IOSPYTrustLifetime = 30.0 * 24.0 * 60.0 * 60.0;
 static const NSTimeInterval IOSPYPairingLifetime = 120.0;

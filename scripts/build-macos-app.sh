@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/dist/macos}"
-VERSION="0.3.0-dream.5"
+VERSION="0.3.0-dream.6"
 APP_NAME="ioscpy dream"
 APP="$OUT/$APP_NAME.app"
 

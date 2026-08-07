@@ -203,9 +203,19 @@ UDP/IPv4 headers, below a standard 1500-byte LAN MTU):
 | reserved       | 2    | zero                                          |
 
 One XOR parity datagram is added per frame and can recover one missing data
-fragment. The Mac keeps at most four incomplete frames and expires partial
-assemblies after 35 ms. There is no playback jitter buffer: late frames are
-dropped, and an unrecoverable inter-frame gap requests a fresh IDR immediately.
+fragment. The Mac keeps at most thirty-two incomplete frames and expires partial
+assemblies after 300 ms. This longer *assembly lifetime* is not a playback
+buffer: completed frames are still delivered immediately and any completion
+older than the last displayed sequence is discarded. The extra lifetime exists
+so a large IDR/config frame is not destroyed simply because its UDP fragments
+take longer than 35 ms to arrive.
+
+An unrecoverable inter-frame gap requests a fresh IDR, but does not freeze the
+receiver while waiting for it. The host continues submitting newer frames to the
+hardware decoder for best-effort concealment. Keyframe requests are rate-limited
+to avoid an IDR storm. If Mac RX FPS remains below 55% of device source FPS for
+two consecutive one-second windows, the session disables UDP and automatically
+falls back to the authenticated TCP video path. Reconnecting attempts UDP again.
 
 ## System actions (`SYSTEM_ACTION` payload, u16 big-endian)
 

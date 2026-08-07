@@ -268,7 +268,7 @@ final class VideoDecodePump: @unchecked Sendable {
     var onNeedKeyframe: (@Sendable () -> Void)?
     var onDroppedStaleChain: (@Sendable () -> Void)?
 
-    init(decoder: VideoDecoder, maxPendingFrames: Int = 3) {
+    init(decoder: VideoDecoder, maxPendingFrames: Int = 12) {
         self.decoder = decoder
         self.maxPendingFrames = max(1, maxPendingFrames)
     }
@@ -339,7 +339,7 @@ final class VideoDecodePump: @unchecked Sendable {
 
     private func keyframeRequestDueLocked() -> Bool {
         let now = DispatchTime.now().uptimeNanoseconds
-        guard now &- lastKeyframeRequestNanos >= 250_000_000 else { return false }
+        guard now &- lastKeyframeRequestNanos >= 500_000_000 else { return false }
         lastKeyframeRequestNanos = now
         return true
     }

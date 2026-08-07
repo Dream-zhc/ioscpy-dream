@@ -34,6 +34,7 @@ final class AppModel: ObservableObject {
     private var didLaunch = false
     private var toolbarHideTask: Task<Void, Never>?
     private var pointerInsideAccessory = false
+    private var lanDegradedWindows = 0
     private let hostID: String
 
     init() {
@@ -158,6 +159,7 @@ final class AppModel: ObservableObject {
         currentDeviceID = updated.id
         activeMode = mode
         blackScreenEnabled = false
+        lanDegradedWindows = 0
 
         try await connected.start(settings: updated.video, audio: updated.audioEnabled)
         startStatsTask()
@@ -322,6 +324,7 @@ final class AppModel: ObservableObject {
         decodePump.reset()
         audioPlayer.stop()
         blackScreenEnabled = false
+        lanDegradedWindows = 0
         screen = .home
         status = .idle
         AppWindowManager.shared.setMirrorMode(false)
@@ -333,6 +336,7 @@ final class AppModel: ObservableObject {
         statsTask = nil
         decodePump.reset()
         audioPlayer.stop()
+        lanDegradedWindows = 0
         guard !userDisconnected, let device = currentDevice else {
             screen = .home
             return
@@ -400,6 +404,28 @@ final class AppModel: ObservableObject {
                 self.stats.receiveFPS = sample.receiveFPS
                 self.stats.presentFPS = sample.presentFPS
                 self.stats.bitrateMbps = sample.bitrateMbps
+                if self.activeMode == .lan,
+                   self.stats.sourceFPS >= 45,
+                   self.stats.receiveFPS < self.stats.sourceFPS * 0.55 {
+                    self.lanDegradedWindows += 1
+                } else {
+                    self.lanDegradedWindows = 0
+                }
+
+                // Safety valve: the low-latency UDP path is preferred, but a
+                // pathological Wi-Fi/AP/packetization condition must never leave
+                // the user at 5-10 FPS. After two consecutive bad windows, fall
+                // back to the already-authenticated TCP video path for this
+                // session. Reconnecting will try UDP again.
+                if self.lanDegradedWindows >= 2 {
+                    let ratio = self.stats.sourceFPS > 0
+                        ? self.stats.receiveFPS / self.stats.sourceFPS : 0
+                    self.stats.transport = "LAN · TCP recovery"
+                    self.session?.fallbackLANVideoToTCP(
+                        reason: String(format: "Mac RX only %.0f%% of device FPS", ratio * 100)
+                    )
+                    self.lanDegradedWindows = 0
+                }
             }
         }
     }
@@ -476,6 +502,7 @@ final class AppWindowManager {
     private var accessoryHostingView: NSHostingView<AnyView>?
     private var windowObservers: [NSObjectProtocol] = []
     private var mirrorDragStartOrigin: NSPoint?
+    private var mirrorResizeActive = false
 
     func attach(_ window: NSWindow) {
         if self.window === window { return }
@@ -493,10 +520,18 @@ final class AppWindowManager {
         if enabled {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
-            window.styleMask = [.borderless, .resizable, .miniaturizable]
+            // Do not expose AppKit's native resize/move interaction in the
+            // borderless mirror. Both are implemented by our dedicated edge and
+            // toolbar NSViews so there is exactly one frame-mutation path.
+            window.styleMask = [.borderless, .miniaturizable]
             window.isOpaque = false
             window.backgroundColor = .clear
             window.hasShadow = true
+            // Mirror dragging is entirely application-controlled. Leaving
+            // AppKit's native move recognizer enabled lets it enter a window
+            // move session at the same time we mutate the parent/child frames,
+            // which can trap inside _endWindowMoveWithEvent on macOS 26.
+            window.isMovable = false
             // Every mouse drag inside the phone belongs to iOS. Enabling
             // background dragging here caused macOS to move the whole window
             // instead of forwarding the gesture to the device.
@@ -515,6 +550,7 @@ final class AppWindowManager {
             window.isOpaque = true
             window.backgroundColor = .windowBackgroundColor
             window.isMovableByWindowBackground = true
+            window.isMovable = true
             window.contentView?.layer?.cornerRadius = 0
             window.contentView?.layer?.masksToBounds = false
             window.contentAspectRatio = .zero
@@ -592,6 +628,10 @@ final class AppWindowManager {
         panel.collectionBehavior = [.fullScreenAuxiliary, .transient]
         panel.level = window.level
         panel.ignoresMouseEvents = false
+        // The panel itself must never begin AppKit's native window-drag path.
+        // The dedicated handle below moves only the parent mirror window.
+        panel.isMovable = false
+        panel.isMovableByWindowBackground = false
 
         let hosting = NSHostingView(rootView: root)
         hosting.frame = NSRect(x: 0, y: 0, width: 390, height: 52)
@@ -622,6 +662,7 @@ final class AppWindowManager {
         accessoryPanel = nil
         accessoryHostingView = nil
         mirrorDragStartOrigin = nil
+        mirrorResizeActive = false
     }
 
     func beginMirrorWindowDrag() {
@@ -632,11 +673,23 @@ final class AppWindowManager {
         guard let window, let start = mirrorDragStartOrigin else { return }
         window.setFrameOrigin(NSPoint(x: start.x + translation.width,
                                       y: start.y - translation.height))
-        repositionMirrorAccessory()
+        // NSWindow child windows follow their parent automatically. Mutating
+        // the panel frame from inside the same drag event can collide with
+        // AppKit's move bookkeeping and was observed in the supplied crash.
     }
 
     func endMirrorWindowDrag() {
         mirrorDragStartOrigin = nil
+        repositionMirrorAccessory()
+    }
+
+    func beginMirrorWindowResize() {
+        mirrorResizeActive = true
+    }
+
+    func endMirrorWindowResize() {
+        mirrorResizeActive = false
+        repositionMirrorAccessory()
     }
 
     private func repositionMirrorAccessory() {
@@ -680,7 +733,10 @@ final class AppWindowManager {
                 queue: .main
             ) { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    self?.repositionMirrorAccessory()
+                    guard let self,
+                          self.mirrorDragStartOrigin == nil,
+                          !self.mirrorResizeActive else { return }
+                    self.repositionMirrorAccessory()
                 }
             })
         }

@@ -97,7 +97,6 @@ final class LANVideoReceiver: @unchecked Sendable {
     private var source: DispatchSourceRead?
     private var assemblies: [UInt32: LANFrameAssembly] = [:]
     private var lastDeliveredSequence: UInt32?
-    private var waitingForKeyframe = false
     private var stopped = false
     private let deliveryLock = NSLock()
     private var deliveredFrames: UInt64 = 0
@@ -117,7 +116,7 @@ final class LANVideoReceiver: @unchecked Sendable {
             throw ConnectionFailure.processFailed("无法创建局域网视频 UDP socket")
         }
 
-        var receiveBuffer = 4 * 1024 * 1024
+        var receiveBuffer = 8 * 1024 * 1024
         setsockopt(socketFD, SOL_SOCKET, SO_RCVBUF, &receiveBuffer, socklen_t(MemoryLayout.size(ofValue: receiveBuffer)))
         let flags = fcntl(socketFD, F_GETFL, 0)
         _ = fcntl(socketFD, F_SETFL, flags | O_NONBLOCK)
@@ -247,9 +246,12 @@ final class LANVideoReceiver: @unchecked Sendable {
                 createdAtNanos: now
             )
             assemblies[sequence] = assembly
-            // Never build latency by retaining a long queue of partially received
-            // frames. Four is enough for normal Wi-Fi reordering at 120 FPS.
-            if assemblies.count > 4 {
+            // A large IDR can span far more than four 120-Hz frame intervals at
+            // 35-45 Mbps. The old four-assembly cap routinely evicted the very
+            // keyframe needed for recovery, collapsing effective FPS after one
+            // tiny Wi-Fi loss. Partial assemblies do not delay completed frames,
+            // so keep enough room for a large IDR while still bounding memory.
+            if assemblies.count > 32 {
                 let oldest = assemblies.min { $0.value.createdAtNanos < $1.value.createdAtNanos }?.key
                 if let oldest, oldest != sequence {
                     assemblies.removeValue(forKey: oldest)
@@ -285,8 +287,10 @@ final class LANVideoReceiver: @unchecked Sendable {
                 return
             }
             if delta > 1 {
-                // A whole frame was not recoverable. For an inter-frame codec all
-                // dependent P-frames are stale, so request an IDR immediately.
+                // A whole frame was not recoverable. Request an IDR, but continue
+                // feeding newer frames to VideoToolbox instead of freezing until
+                // the IDR arrives. Hardware concealment is far less disruptive
+                // than turning every tiny Wi-Fi loss into a 250-1000 ms stall.
                 telemetryLost &+= UInt64(delta - 1)
                 noteLoss()
             }
@@ -295,10 +299,6 @@ final class LANVideoReceiver: @unchecked Sendable {
         guard let packet = parseVideoPacket(body) else {
             noteLoss()
             return
-        }
-        if waitingForKeyframe {
-            guard packet.isKeyframe else { return }
-            waitingForKeyframe = false
         }
         deliveryLock.lock()
         deliveredFrames &+= 1
@@ -309,7 +309,11 @@ final class LANVideoReceiver: @unchecked Sendable {
 
     private func expireOldAssemblies() {
         let now = DispatchTime.now().uptimeNanoseconds
-        let deadline: UInt64 = 35_000_000 // ~4 frames at 120 FPS
+        // Do not use a 35 ms fixed expiry here. At 45 Mbps, a 300-500 KB IDR
+        // alone can take roughly 55-90 ms to arrive even on a healthy LAN. Old
+        // completed frames are still rejected by sequence, so a longer partial
+        // assembly lifetime does not add presentation latency.
+        let deadline: UInt64 = 300_000_000
         let expired = assemblies.compactMap { key, value in
             now &- value.createdAtNanos > deadline ? key : nil
         }
@@ -319,10 +323,7 @@ final class LANVideoReceiver: @unchecked Sendable {
     }
 
     private func noteLoss() {
-        if !waitingForKeyframe {
-            waitingForKeyframe = true
-            onFrameLoss?()
-        }
+        onFrameLoss?()
     }
 
     private func emitTelemetryIfNeeded() {

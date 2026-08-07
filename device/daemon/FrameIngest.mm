@@ -48,6 +48,7 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
     uint64_t _udpToken;
     uint32_t _udpFrameSequence;
     NSLock *_udpLock;
+    CFAbsoluteTime _lastUDPKeyframeRequestTime;
 }
 
 + (instancetype)shared {
@@ -89,7 +90,7 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
             if (flags >= 0) {
                 fcntl(fd, F_SETFL, flags | O_NONBLOCK);
             }
-            int sndbuf = 2 * 1024 * 1024;
+            int sndbuf = 8 * 1024 * 1024;
             setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 #if defined(SO_NET_SERVICE_TYPE) && defined(NET_SERVICE_TYPE_VI)
             int serviceType = NET_SERVICE_TYPE_VI;
@@ -295,7 +296,11 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
                     // Wi-Fi is under pressure. The Mac requests a fresh IDR when
                     // it detects an unrecoverable sequence gap.
                     if (![self sendLANVideoFrame:payload]) {
-                        [self sendToTweak:IOSPYMsgRequestKeyframe];
+                        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                        if (now - _lastUDPKeyframeRequestTime >= 0.5) {
+                            _lastUDPKeyframeRequestTime = now;
+                            [self sendToTweak:IOSPYMsgRequestKeyframe];
+                        }
                     }
                     continue;
                 }

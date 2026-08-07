@@ -323,7 +323,6 @@ struct MirrorAccessoryBar: View {
     @ObservedObject var store: SettingsStore
 
     private var device: DeviceProfile? { model.currentDevice }
-    @State private var draggingWindow = false
 
     private var displayedFPS: Double {
         // What matters to the user is the complete frame rate that actually
@@ -334,27 +333,14 @@ struct MirrorAccessoryBar: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            Image(systemName: "line.3.horizontal")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 24, height: 31)
-                .contentShape(Rectangle())
-                .help("拖动镜像窗口")
-                .gesture(
-                    DragGesture(minimumDistance: 1, coordinateSpace: .global)
-                        .onChanged { value in
-                            if !draggingWindow {
-                                draggingWindow = true
-                                AppWindowManager.shared.beginMirrorWindowDrag()
-                            }
-                            AppWindowManager.shared.updateMirrorWindowDrag(translation: value.translation)
-                            model.revealToolbar()
-                        }
-                        .onEnded { _ in
-                            draggingWindow = false
-                            AppWindowManager.shared.endMirrorWindowDrag()
-                        }
-                )
+            ZStack {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                MirrorWindowDragHandleRepresentable()
+            }
+            .frame(width: 30, height: 31)
+            .help("拖动镜像窗口")
 
             Text(String(format: "%.0f FPS", displayedFPS))
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))

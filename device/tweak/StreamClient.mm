@@ -274,7 +274,10 @@ static uint64_t clipHash(NSString *t) {
         } else if (header.type == IOSPYMsgRequestKeyframe) {
             dispatch_async(_captureQueue, ^{
                 self->_needKeyframe = YES;
-                self->_dropUntilKeyframe = YES;
+                // A remote loss request does not mean our local encoded chain is
+                // broken. Keep sending current P-frames while the forced IDR is
+                // being produced; suppressing them here turned minor Wi-Fi loss
+                // into a visible freeze and keyframe storm.
             });
         } else if (header.type == IOSPYMsgInputTouch && payload.length >= 10) {
             const uint8_t *b = (const uint8_t *)payload.bytes;
@@ -670,10 +673,12 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     if (!IOSPYHardwareVideoAvailable(_codec)) {
         return NO;
     }
-    // Do not create more encoded work while the transport already has two
-    // frames waiting. This keeps transient USB/Wi-Fi stalls from turning into a
-    // visible latency ramp that takes seconds to drain.
-    if (_sendBacklog >= 2) {
+    // Allow a very short burst on the SpringBoard->daemon loopback link. dream.5
+    // capped this at two frames, so UDP fragmentation work in the daemon could
+    // momentarily backpressure the loopback socket and repeatedly break the
+    // reference chain. Four frames is ~33 ms at 120 Hz and remains bounded.
+    NSUInteger maxSendBacklog = _config.target_fps >= 100 ? 4 : 2;
+    if (_sendBacklog >= maxSendBacklog) {
         _droppedFrames++;
         _dropSendPressure++;
         return YES;
@@ -770,10 +775,10 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                 return;
             }
 
-            // Keep the socket queue short. If two encoded frames are already
-            // waiting, discard this one and force a new keyframe so the decoder
-            // can recover without replaying stale inter-frames.
-            if (self->_sendBacklog >= 2) {
+            // Keep the loopback queue bounded while tolerating short scheduling
+            // bursts at 90/120 Hz.
+            NSUInteger completionBacklogLimit = self->_config.target_fps >= 100 ? 4 : 2;
+            if (self->_sendBacklog >= completionBacklogLimit) {
                 self->_droppedFrames++;
                 self->_dropSendPressure++;
                 self->_needKeyframe = YES;

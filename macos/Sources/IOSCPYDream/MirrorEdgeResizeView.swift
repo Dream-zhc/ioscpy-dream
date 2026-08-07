@@ -55,6 +55,7 @@ final class MirrorEdgeResizeNSView: NSView {
         startAspect = ratio.width > 0 && ratio.height > 0
             ? ratio.width / ratio.height
             : startFrame.width / max(startFrame.height, 1)
+        AppWindowManager.shared.beginMirrorWindowResize()
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -116,6 +117,7 @@ final class MirrorEdgeResizeNSView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         activeEdges = []
+        AppWindowManager.shared.endMirrorWindowResize()
     }
 
     private func edges(at point: NSPoint) -> MirrorResizeEdges {
@@ -135,6 +137,58 @@ struct MirrorEdgeResizeRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: MirrorEdgeResizeNSView, context: Context) {
+        nsView.window?.invalidateCursorRects(for: nsView)
+    }
+}
+
+/// Dedicated AppKit drag surface for the floating toolbar. A native NSView is
+/// used instead of SwiftUI DragGesture so AppKit never starts a competing
+/// NSPanel move session while we move the parent mirror window ourselves.
+@MainActor
+final class MirrorWindowDragHandleNSView: NSView {
+    private var startMouse = NSPoint.zero
+    private var dragging = false
+
+    override var acceptsFirstResponder: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .openHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        startMouse = NSEvent.mouseLocation
+        dragging = true
+        NSCursor.closedHand.push()
+        AppWindowManager.shared.beginMirrorWindowDrag()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard dragging else { return }
+        let mouse = NSEvent.mouseLocation
+        AppWindowManager.shared.updateMirrorWindowDrag(
+            translation: CGSize(
+                width: mouse.x - startMouse.x,
+                height: startMouse.y - mouse.y
+            )
+        )
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard dragging else { return }
+        dragging = false
+        NSCursor.pop()
+        AppWindowManager.shared.endMirrorWindowDrag()
+    }
+}
+
+struct MirrorWindowDragHandleRepresentable: NSViewRepresentable {
+    func makeNSView(context: Context) -> MirrorWindowDragHandleNSView {
+        MirrorWindowDragHandleNSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: MirrorWindowDragHandleNSView, context: Context) {
         nsView.window?.invalidateCursorRects(for: nsView)
     }
 }
