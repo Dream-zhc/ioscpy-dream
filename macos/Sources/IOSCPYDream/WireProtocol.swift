@@ -64,7 +64,7 @@ struct WireFrame {
 
 struct HelloPayload: Encodable {
     let role = "host"
-    let hostVersion = "0.3.0-dream.6"
+    let hostVersion = "0.3.0-dream.7"
     let protocolVersion = Wire.version
     let nonce: String
     let hostID: String

@@ -38,6 +38,7 @@ final class AppModel: ObservableObject {
     private let hostID: String
 
     init() {
+        DiagnosticsLogger.shared.start()
         let defaults = UserDefaults.standard
         if let existing = defaults.string(forKey: "host-id"), !existing.isEmpty {
             hostID = existing
@@ -48,6 +49,13 @@ final class AppModel: ObservableObject {
         }
 
         let mailbox = frameMailbox
+        let counters = performanceCounters
+        decoder.onDecodeLatency = { latencyMs in
+            counters.recordDecode(latencyMs: latencyMs)
+        }
+        decodePump.onQueueTelemetry = { waitMs, pending in
+            counters.recordDecodeQueue(waitMs: waitMs, pending: pending)
+        }
         decoder.onPixelBuffer = { [weak self] envelope, width, height, orientation in
             let geometryChanged = mailbox.publish(
                 envelope.buffer,
@@ -63,6 +71,7 @@ final class AppModel: ObservableObject {
         }
         decoder.onDecodeError = { error in
             NSLog("[ioscpy] decode: %@", error)
+            DiagnosticsLogger.shared.logMessage("decode_error", error)
         }
     }
 
@@ -121,6 +130,16 @@ final class AppModel: ObservableObject {
         activeMode = mode
         screen = .connecting
         status = .connecting(automatic ? "正在自动连接 \(device.name)…" : "正在连接 \(device.name)…")
+        DiagnosticsLogger.shared.log("connect_begin", fields: [
+            "device_name": device.name,
+            "mode": mode.rawValue,
+            "automatic": automatic,
+            "lan_host": mode == .lan ? device.lanHost : "",
+            "target_fps": device.video.targetFPS,
+            "max_dimension": device.video.maxDimension,
+            "bitrate_mbps": device.video.bitrateMbps,
+            "codec": device.video.codec.title,
+        ])
         AppWindowManager.shared.setMirrorMode(false)
         do {
             try await establish(device: device, mode: mode, pairCode: nil)
@@ -131,6 +150,7 @@ final class AppModel: ObservableObject {
             status = .pairing(challenge.message)
             screen = .home
         } catch {
+            DiagnosticsLogger.shared.logMessage("connect_failed", error.localizedDescription)
             status = .failed(error.localizedDescription)
             screen = .home
         }
@@ -162,6 +182,17 @@ final class AppModel: ObservableObject {
         lanDegradedWindows = 0
 
         try await connected.start(settings: updated.video, audio: updated.audioEnabled)
+        DiagnosticsLogger.shared.log("connect_ready", fields: [
+            "mode": mode.rawValue,
+            "device_model": connected.capabilities.deviceModel,
+            "ios_version": connected.capabilities.iosVersion,
+            "stream_backends": connected.capabilities.streamBackends,
+            "input_backends": connected.capabilities.inputBackends,
+            "target_fps": updated.video.targetFPS,
+            "max_dimension": updated.video.maxDimension,
+            "bitrate_mbps": updated.video.bitrateMbps,
+            "codec": updated.video.codec.title,
+        ])
         startStatsTask()
         screen = .mirror
         status = .connected("\(mode.title) · \(connected.capabilities.deviceModel) · iOS \(connected.capabilities.iosVersion)")
@@ -184,11 +215,16 @@ final class AppModel: ObservableObject {
         let counters = performanceCounters
         decoder.onDecodeError = { [weak connected] error in
             NSLog("[ioscpy] decode: %@", error)
+            DiagnosticsLogger.shared.logMessage("decode_error", error)
             connected?.requestKeyframe()
         }
         decodePump.onNeedKeyframe = { [weak connected] in connected?.requestKeyframe() }
         decodePump.onDroppedStaleChain = {
             NSLog("[ioscpy] decoder backlog discarded; requesting fresh keyframe")
+            DiagnosticsLogger.shared.logMessage(
+                "decoder_chain_drop",
+                "decoder backlog discarded; requesting fresh keyframe"
+            )
         }
         connected.onVideo = { packet in
             counters.recordReceived(bytes: packet.bytes.count)
@@ -196,6 +232,7 @@ final class AppModel: ObservableObject {
         }
         connected.onStats = { data in
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            DiagnosticsLogger.shared.log("device_stats", fields: object)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let windowMs = max((object["window_ms"] as? NSNumber)?.doubleValue ?? 1000, 1)
@@ -257,12 +294,32 @@ final class AppModel: ObservableObject {
                 }
             }
         }
-        connected.onLog = { message in NSLog("[ioscpy] device: %@", message) }
+        connected.onLog = { message in
+            NSLog("[ioscpy] device: %@", message)
+            DiagnosticsLogger.shared.logMessage("device_log", message)
+        }
         connected.onAudio = { [weak self] packet in self?.audioPlayer.enqueue(packet) }
         connected.onRTT = { [weak self] value in
             Task { @MainActor [weak self] in self?.stats.latencyMs = value }
         }
+        connected.onRealtimeSendLatency = { latencyMs in
+            counters.recordInputSend(latencyMs: latencyMs)
+        }
         connected.onLANVideoTelemetry = { [weak self] sample in
+            DiagnosticsLogger.shared.log("lan_video", fields: [
+                "packets_per_second": sample.packetsPerSecond,
+                "recovered_frames": sample.recoveredFrames,
+                "lost_frames": sample.lostFrames,
+                "late_frames": sample.lateFrames,
+                "frame_rx_ms_avg": sample.frameReceiveMsAverage,
+                "frame_rx_ms_p50": sample.frameReceiveMsP50,
+                "frame_rx_ms_p95": sample.frameReceiveMsP95,
+                "frame_rx_ms_p99": sample.frameReceiveMsP99,
+                "frame_rx_ms_max": sample.frameReceiveMsMax,
+                "packet_gap_ms_p95": sample.packetGapMsP95,
+                "packet_gap_ms_p99": sample.packetGapMsP99,
+                "packet_gap_ms_max": sample.packetGapMsMax,
+            ])
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.stats.lanPacketsPerSecond = sample.packetsPerSecond
@@ -285,6 +342,10 @@ final class AppModel: ObservableObject {
             }
         }
         connected.onDisconnected = { [weak self, weak connected] error in
+            DiagnosticsLogger.shared.logMessage(
+                "transport_disconnected",
+                error?.localizedDescription ?? "connection closed"
+            )
             Task { @MainActor [weak self] in
                 guard let self, let connected, self.session === connected else { return }
                 self.handleDisconnect(error)
@@ -314,6 +375,7 @@ final class AppModel: ObservableObject {
     }
 
     func disconnect() {
+        DiagnosticsLogger.shared.logMessage("disconnect", "user initiated")
         userDisconnected = true
         reconnectTask?.cancel()
         reconnectTask = nil
@@ -331,6 +393,10 @@ final class AppModel: ObservableObject {
     }
 
     private func handleDisconnect(_ error: Error?) {
+        DiagnosticsLogger.shared.logMessage(
+            "reconnect_required",
+            error?.localizedDescription ?? "connection interrupted"
+        )
         session = nil
         statsTask?.cancel()
         statsTask = nil
@@ -380,6 +446,9 @@ final class AppModel: ObservableObject {
         view.onPointerActivity = { [weak self] in Task { @MainActor in self?.revealToolbar() } }
         let counters = performanceCounters
         view.onFramePresented = { counters.recordPresented() }
+        view.onRenderTelemetry = { frameAgeMs, renderSubmitMs in
+            counters.recordRender(frameAgeMs: frameAgeMs, submitMs: renderSubmitMs)
+        }
         DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
     }
 
@@ -404,6 +473,37 @@ final class AppModel: ObservableObject {
                 self.stats.receiveFPS = sample.receiveFPS
                 self.stats.presentFPS = sample.presentFPS
                 self.stats.bitrateMbps = sample.bitrateMbps
+                DiagnosticsLogger.shared.log("host_stats", fields: [
+                    "mode": self.activeMode.rawValue,
+                    "transport": self.stats.transport,
+                    "mac_rx_fps": sample.receiveFPS,
+                    "mac_present_fps": sample.presentFPS,
+                    "device_source_fps": self.stats.sourceFPS,
+                    "device_capture_fps": self.stats.captureFPS,
+                    "device_encode_fps": self.stats.encodeFPS,
+                    "bitrate_mbps": sample.bitrateMbps,
+                    "rtt_ms": self.stats.latencyMs,
+                    "rx_gap_ms_p50": sample.receiveGapP50Ms,
+                    "rx_gap_ms_p95": sample.receiveGapP95Ms,
+                    "rx_gap_ms_p99": sample.receiveGapP99Ms,
+                    "rx_gap_ms_max": sample.receiveGapMaxMs,
+                    "decode_queue_ms_p50": sample.decodeQueueP50Ms,
+                    "decode_queue_ms_p95": sample.decodeQueueP95Ms,
+                    "decode_queue_ms_p99": sample.decodeQueueP99Ms,
+                    "decode_ms_p50": sample.decodeP50Ms,
+                    "decode_ms_p95": sample.decodeP95Ms,
+                    "decode_ms_p99": sample.decodeP99Ms,
+                    "frame_age_ms_p50": sample.frameAgeP50Ms,
+                    "frame_age_ms_p95": sample.frameAgeP95Ms,
+                    "frame_age_ms_p99": sample.frameAgeP99Ms,
+                    "render_submit_ms_p50": sample.renderSubmitP50Ms,
+                    "render_submit_ms_p95": sample.renderSubmitP95Ms,
+                    "render_submit_ms_p99": sample.renderSubmitP99Ms,
+                    "input_send_ms_p50": sample.inputSendP50Ms,
+                    "input_send_ms_p95": sample.inputSendP95Ms,
+                    "input_send_ms_p99": sample.inputSendP99Ms,
+                    "decode_pending_max": sample.decodePendingMax,
+                ])
                 if self.activeMode == .lan,
                    self.stats.sourceFPS >= 45,
                    self.stats.receiveFPS < self.stats.sourceFPS * 0.55 {
@@ -421,6 +521,12 @@ final class AppModel: ObservableObject {
                     let ratio = self.stats.sourceFPS > 0
                         ? self.stats.receiveFPS / self.stats.sourceFPS : 0
                     self.stats.transport = "LAN · TCP recovery"
+                    DiagnosticsLogger.shared.log("lan_fallback", fields: [
+                        "reason": "Mac RX below 55% of device source FPS for two windows",
+                        "mac_rx_fps": self.stats.receiveFPS,
+                        "device_source_fps": self.stats.sourceFPS,
+                        "ratio": ratio,
+                    ])
                     self.session?.fallbackLANVideoToTCP(
                         reason: String(format: "Mac RX only %.0f%% of device FPS", ratio * 100)
                     )
@@ -749,15 +855,57 @@ final class AppWindowManager {
     }
 }
 
+private struct HostPerformanceSample: Sendable {
+    let receiveFPS: Double
+    let presentFPS: Double
+    let bitrateMbps: Double
+    let receiveGapP50Ms: Double
+    let receiveGapP95Ms: Double
+    let receiveGapP99Ms: Double
+    let receiveGapMaxMs: Double
+    let decodeQueueP50Ms: Double
+    let decodeQueueP95Ms: Double
+    let decodeQueueP99Ms: Double
+    let decodeP50Ms: Double
+    let decodeP95Ms: Double
+    let decodeP99Ms: Double
+    let frameAgeP50Ms: Double
+    let frameAgeP95Ms: Double
+    let frameAgeP99Ms: Double
+    let renderSubmitP50Ms: Double
+    let renderSubmitP95Ms: Double
+    let renderSubmitP99Ms: Double
+    let inputSendP50Ms: Double
+    let inputSendP95Ms: Double
+    let inputSendP99Ms: Double
+    let decodePendingMax: Int
+}
+
 private final class PerformanceCounters: @unchecked Sendable {
     private let lock = NSLock()
     private var receivedFrames = 0
     private var presentedFrames = 0
     private var receivedBytes = 0
     private var startedAt = ContinuousClock.now
+    private var lastReceivedAtNanos: UInt64 = 0
+    private var receiveGapMaxMs: Double = 0
+    private var receiveGapSamples: [Double] = []
+    private var decodeQueueSamples: [Double] = []
+    private var decodeSamples: [Double] = []
+    private var frameAgeSamples: [Double] = []
+    private var renderSubmitSamples: [Double] = []
+    private var inputSendSamples: [Double] = []
+    private var decodePendingMax = 0
 
     func recordReceived(bytes: Int) {
+        let now = DispatchTime.now().uptimeNanoseconds
         lock.lock()
+        if lastReceivedAtNanos > 0 {
+            let gap = Double(now &- lastReceivedAtNanos) / 1_000_000
+            receiveGapMaxMs = max(receiveGapMaxMs, gap)
+            appendBounded(gap, to: &receiveGapSamples)
+        }
+        lastReceivedAtNanos = now
         receivedFrames += 1
         receivedBytes += bytes
         lock.unlock()
@@ -769,16 +917,51 @@ private final class PerformanceCounters: @unchecked Sendable {
         lock.unlock()
     }
 
+    func recordDecodeQueue(waitMs: Double, pending: Int) {
+        lock.lock()
+        appendBounded(waitMs, to: &decodeQueueSamples)
+        decodePendingMax = max(decodePendingMax, pending)
+        lock.unlock()
+    }
+
+    func recordDecode(latencyMs: Double) {
+        lock.lock()
+        appendBounded(latencyMs, to: &decodeSamples)
+        lock.unlock()
+    }
+
+    func recordRender(frameAgeMs: Double, submitMs: Double) {
+        lock.lock()
+        appendBounded(frameAgeMs, to: &frameAgeSamples)
+        appendBounded(submitMs, to: &renderSubmitSamples)
+        lock.unlock()
+    }
+
+    func recordInputSend(latencyMs: Double) {
+        lock.lock()
+        appendBounded(latencyMs, to: &inputSendSamples)
+        lock.unlock()
+    }
+
     func reset() {
         lock.lock()
         receivedFrames = 0
         presentedFrames = 0
         receivedBytes = 0
+        lastReceivedAtNanos = 0
+        receiveGapMaxMs = 0
+        receiveGapSamples.removeAll(keepingCapacity: true)
+        decodeQueueSamples.removeAll(keepingCapacity: true)
+        decodeSamples.removeAll(keepingCapacity: true)
+        frameAgeSamples.removeAll(keepingCapacity: true)
+        renderSubmitSamples.removeAll(keepingCapacity: true)
+        inputSendSamples.removeAll(keepingCapacity: true)
+        decodePendingMax = 0
         startedAt = .now
         lock.unlock()
     }
 
-    func consume() -> (receiveFPS: Double, presentFPS: Double, bitrateMbps: Double) {
+    func consume() -> HostPerformanceSample {
         lock.lock()
         defer { lock.unlock() }
         let elapsed = startedAt.duration(to: .now)
@@ -786,15 +969,58 @@ private final class PerformanceCounters: @unchecked Sendable {
             0.001,
             Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
         )
-        let sample = (
+        let sample = HostPerformanceSample(
             receiveFPS: Double(receivedFrames) / seconds,
             presentFPS: Double(presentedFrames) / seconds,
-            bitrateMbps: Double(receivedBytes * 8) / seconds / 1_000_000
+            bitrateMbps: Double(receivedBytes * 8) / seconds / 1_000_000,
+            receiveGapP50Ms: hostPercentile(receiveGapSamples, 0.50),
+            receiveGapP95Ms: hostPercentile(receiveGapSamples, 0.95),
+            receiveGapP99Ms: hostPercentile(receiveGapSamples, 0.99),
+            receiveGapMaxMs: receiveGapMaxMs,
+            decodeQueueP50Ms: hostPercentile(decodeQueueSamples, 0.50),
+            decodeQueueP95Ms: hostPercentile(decodeQueueSamples, 0.95),
+            decodeQueueP99Ms: hostPercentile(decodeQueueSamples, 0.99),
+            decodeP50Ms: hostPercentile(decodeSamples, 0.50),
+            decodeP95Ms: hostPercentile(decodeSamples, 0.95),
+            decodeP99Ms: hostPercentile(decodeSamples, 0.99),
+            frameAgeP50Ms: hostPercentile(frameAgeSamples, 0.50),
+            frameAgeP95Ms: hostPercentile(frameAgeSamples, 0.95),
+            frameAgeP99Ms: hostPercentile(frameAgeSamples, 0.99),
+            renderSubmitP50Ms: hostPercentile(renderSubmitSamples, 0.50),
+            renderSubmitP95Ms: hostPercentile(renderSubmitSamples, 0.95),
+            renderSubmitP99Ms: hostPercentile(renderSubmitSamples, 0.99),
+            inputSendP50Ms: hostPercentile(inputSendSamples, 0.50),
+            inputSendP95Ms: hostPercentile(inputSendSamples, 0.95),
+            inputSendP99Ms: hostPercentile(inputSendSamples, 0.99),
+            decodePendingMax: decodePendingMax
         )
         receivedFrames = 0
         presentedFrames = 0
         receivedBytes = 0
+        receiveGapMaxMs = 0
+        receiveGapSamples.removeAll(keepingCapacity: true)
+        decodeQueueSamples.removeAll(keepingCapacity: true)
+        decodeSamples.removeAll(keepingCapacity: true)
+        frameAgeSamples.removeAll(keepingCapacity: true)
+        renderSubmitSamples.removeAll(keepingCapacity: true)
+        inputSendSamples.removeAll(keepingCapacity: true)
+        decodePendingMax = 0
         startedAt = .now
         return sample
     }
+
+    private func appendBounded(_ value: Double, to samples: inout [Double]) {
+        guard value.isFinite, value >= 0 else { return }
+        if samples.count < 512 {
+            samples.append(value)
+        }
+    }
+}
+
+private func hostPercentile(_ values: [Double], _ quantile: Double) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let q = min(max(quantile, 0), 1)
+    let index = Int((Double(sorted.count - 1) * q).rounded())
+    return sorted[min(max(index, 0), sorted.count - 1)]
 }

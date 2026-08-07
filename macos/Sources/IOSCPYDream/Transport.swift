@@ -265,8 +265,10 @@ final class IOSCPYSession: @unchecked Sendable {
     private var sequence: UInt64 = 1
     private let inputStateLock = NSLock()
     private var pendingTouchMove: Data?
+    private var pendingTouchMoveAtNanos: UInt64 = 0
     private var touchMoveInFlight = false
     private var pendingScroll: Data?
+    private var pendingScrollAtNanos: UInt64 = 0
     private var scrollInFlight = false
     private var lastKeyframeRequestNanos: UInt64 = 0
     private let lanFallbackLock = NSLock()
@@ -281,6 +283,7 @@ final class IOSCPYSession: @unchecked Sendable {
     var onStats: (@Sendable (Data) -> Void)?
     var onRTT: (@Sendable (Double) -> Void)?
     var onLANVideoTelemetry: (@Sendable (LANVideoTelemetry) -> Void)?
+    var onRealtimeSendLatency: (@Sendable (Double) -> Void)?
     var onLog: (@Sendable (String) -> Void)?
     var onDisconnected: (@Sendable (Error?) -> Void)?
 
@@ -399,7 +402,7 @@ final class IOSCPYSession: @unchecked Sendable {
                 }
                 guard !liveCapabilities.streamBackends.isEmpty else {
                     throw ConnectionFailure.processFailed(
-                        "iPhone 的 SpringBoard 控制桥接尚未就绪。请确认 dream.6 手机端已安装；无需先打开旧版 App，等待几秒后重试即可。"
+                        "iPhone 的 SpringBoard 控制桥接尚未就绪。请确认 dream.7 手机端已安装；无需先打开旧版 App，等待几秒后重试即可。"
                     )
                 }
             }
@@ -563,11 +566,16 @@ final class IOSCPYSession: @unchecked Sendable {
     }
 
     private func enqueue(type: MessageType, payload: Data = Data(), streamID: UInt64 = Wire.channelControl) {
+        let createdAtNanos = DispatchTime.now().uptimeNanoseconds
         let current = nextSequence()
         let frame = makeWireFrame(type: type, streamID: streamID, sequence: current, payload: payload)
         realtimeSendQueue.async { [weak self] in
             guard let self, !self.stopped else { return }
             self.transport.enqueue(frame) { error in
+                let finishedAtNanos = DispatchTime.now().uptimeNanoseconds
+                self.onRealtimeSendLatency?(
+                    Double(finishedAtNanos &- createdAtNanos) / 1_000_000
+                )
                 if let error {
                     NSLog("[ioscpy] realtime send failed: %@", error.localizedDescription)
                 }
@@ -578,6 +586,7 @@ final class IOSCPYSession: @unchecked Sendable {
     private func enqueueLatestTouchMove(_ payload: Data) {
         inputStateLock.lock()
         pendingTouchMove = payload
+        pendingTouchMoveAtNanos = DispatchTime.now().uptimeNanoseconds
         let shouldStart = !touchMoveInFlight
         if shouldStart { touchMoveInFlight = true }
         inputStateLock.unlock()
@@ -593,13 +602,16 @@ final class IOSCPYSession: @unchecked Sendable {
             inputStateLock.unlock()
             return
         }
+        let createdAtNanos = pendingTouchMoveAtNanos
         pendingTouchMove = nil
+        pendingTouchMoveAtNanos = 0
         inputStateLock.unlock()
 
         guard !stopped else {
             inputStateLock.lock()
             touchMoveInFlight = false
             pendingTouchMove = nil
+            pendingTouchMoveAtNanos = 0
             inputStateLock.unlock()
             return
         }
@@ -611,6 +623,12 @@ final class IOSCPYSession: @unchecked Sendable {
         )
         transport.enqueue(frame) { [weak self] error in
             guard let self else { return }
+            let finishedAtNanos = DispatchTime.now().uptimeNanoseconds
+            if createdAtNanos > 0 {
+                self.onRealtimeSendLatency?(
+                    Double(finishedAtNanos &- createdAtNanos) / 1_000_000
+                )
+            }
             if let error {
                 NSLog("[ioscpy] touch send failed: %@", error.localizedDescription)
             }
@@ -623,12 +641,14 @@ final class IOSCPYSession: @unchecked Sendable {
     private func discardPendingTouchMove() {
         inputStateLock.lock()
         pendingTouchMove = nil
+        pendingTouchMoveAtNanos = 0
         inputStateLock.unlock()
     }
 
     private func enqueueCoalescedScroll(_ payload: Data) {
         inputStateLock.lock()
         pendingScroll = mergeScrollPayload(pendingScroll, payload)
+        pendingScrollAtNanos = DispatchTime.now().uptimeNanoseconds
         let shouldStart = !scrollInFlight
         if shouldStart { scrollInFlight = true }
         inputStateLock.unlock()
@@ -644,13 +664,16 @@ final class IOSCPYSession: @unchecked Sendable {
             inputStateLock.unlock()
             return
         }
+        let createdAtNanos = pendingScrollAtNanos
         pendingScroll = nil
+        pendingScrollAtNanos = 0
         inputStateLock.unlock()
 
         guard !stopped else {
             inputStateLock.lock()
             scrollInFlight = false
             pendingScroll = nil
+            pendingScrollAtNanos = 0
             inputStateLock.unlock()
             return
         }
@@ -662,6 +685,12 @@ final class IOSCPYSession: @unchecked Sendable {
         )
         transport.enqueue(frame) { [weak self] error in
             guard let self else { return }
+            let finishedAtNanos = DispatchTime.now().uptimeNanoseconds
+            if createdAtNanos > 0 {
+                self.onRealtimeSendLatency?(
+                    Double(finishedAtNanos &- createdAtNanos) / 1_000_000
+                )
+            }
             if let error {
                 NSLog("[ioscpy] scroll send failed: %@", error.localizedDescription)
             }
@@ -675,6 +704,7 @@ final class IOSCPYSession: @unchecked Sendable {
         inputStateLock.lock()
         let merged = mergeScrollPayload(pendingScroll, payload)
         pendingScroll = nil
+        pendingScrollAtNanos = 0
         inputStateLock.unlock()
         return merged
     }
@@ -682,6 +712,7 @@ final class IOSCPYSession: @unchecked Sendable {
     private func discardPendingScroll() {
         inputStateLock.lock()
         pendingScroll = nil
+        pendingScrollAtNanos = 0
         inputStateLock.unlock()
     }
 

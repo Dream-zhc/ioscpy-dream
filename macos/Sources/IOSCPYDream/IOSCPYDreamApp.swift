@@ -26,6 +26,12 @@ struct IOSCPYDreamApp: App {
                 Divider()
                 Button("断开") { model.disconnect() }.keyboardShortcut("d", modifiers: [.command, .shift])
             }
+            CommandMenu("诊断") {
+                Button("在 Finder 中显示最新日志") {
+                    DiagnosticsLogger.shared.revealInFinder()
+                }
+                .keyboardShortcut("l", modifiers: [.command, .option])
+            }
         }
     }
 }
@@ -37,4 +43,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        DiagnosticsLogger.shared.logMessage("app_terminate", "normal termination")
+        DiagnosticsLogger.shared.flush()
+    }
 }

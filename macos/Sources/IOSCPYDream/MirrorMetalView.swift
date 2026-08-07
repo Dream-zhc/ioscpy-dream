@@ -10,6 +10,7 @@ final class VideoFrameMailbox: @unchecked Sendable {
         let height: Int
         let orientation: Int
         let generation: UInt64
+        let publishedAtNanos: UInt64
     }
 
     private let lock = NSLock()
@@ -18,6 +19,7 @@ final class VideoFrameMailbox: @unchecked Sendable {
     private var height = 852
     private var orientation = 1
     private var generation: UInt64 = 0
+    private var publishedAtNanos: UInt64 = 0
 
     @discardableResult
     func publish(_ buffer: CVPixelBuffer, width: Int, height: Int, orientation: Int) -> Bool {
@@ -28,6 +30,7 @@ final class VideoFrameMailbox: @unchecked Sendable {
         self.width = max(width, 1)
         self.height = max(height, 1)
         self.orientation = orientation
+        publishedAtNanos = DispatchTime.now().uptimeNanoseconds
         generation &+= 1
         return geometryChanged
     }
@@ -41,7 +44,8 @@ final class VideoFrameMailbox: @unchecked Sendable {
             width: width,
             height: height,
             orientation: orientation,
-            generation: generation
+            generation: generation,
+            publishedAtNanos: publishedAtNanos
         )
     }
 
@@ -60,6 +64,7 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
     var onKey: ((UInt8) -> Void)?
     var onHomeGesture: (() -> Void)?
     var onFramePresented: (() -> Void)?
+    var onRenderTelemetry: ((Double, Double) -> Void)?
     var onPointerActivity: (() -> Void)?
 
     private let mailbox: VideoFrameMailbox
@@ -109,6 +114,7 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
 
     func draw(in view: MTKView) {
         guard let snapshot = mailbox.snapshot(after: renderedGeneration) else { return }
+        let drawStartedAtNanos = DispatchTime.now().uptimeNanoseconds
         renderedGeneration = snapshot.generation
         let buffer = snapshot.buffer
         let orientation = snapshot.orientation
@@ -147,6 +153,10 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
         // for every frame. The counter is thread-safe and this draw callback is
         // already synchronized with MTKView's display cadence.
         onFramePresented?()
+        let committedAtNanos = DispatchTime.now().uptimeNanoseconds
+        let frameAgeMs = Double(drawStartedAtNanos &- snapshot.publishedAtNanos) / 1_000_000
+        let renderSubmitMs = Double(committedAtNanos &- drawStartedAtNanos) / 1_000_000
+        onRenderTelemetry?(frameAgeMs, renderSubmitMs)
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}

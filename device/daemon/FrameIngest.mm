@@ -11,6 +11,8 @@
 #import <fcntl.h>
 #import <unistd.h>
 #import <errno.h>
+#import <math.h>
+#import <stdlib.h>
 
 static const uint32_t kIOSPYLANVideoMagic = 0x49554450u; // "IUDP"
 static const uint8_t kIOSPYLANVideoVersion = 1;
@@ -18,6 +20,24 @@ static const uint8_t kIOSPYLANVideoParityFlag = 0x01;
 // Standard IPv4 LAN MTU is 1500. 1400 data + 32 app + 28 UDP/IP = 1460,
 // avoiding IP fragmentation while keeping packet rate lower at 120 FPS.
 static const size_t kIOSPYLANVideoFragmentPayload = 1400;
+static const NSUInteger kIOSPYUDPTelemetrySamples = 256;
+
+static int compareUDPMetricDouble(const void *a, const void *b) {
+    double lhs = *(const double *)a;
+    double rhs = *(const double *)b;
+    return lhs < rhs ? -1 : (lhs > rhs ? 1 : 0);
+}
+
+static double udpMetricPercentile(const double *samples, NSUInteger writes, double q) {
+    NSUInteger count = MIN(writes, kIOSPYUDPTelemetrySamples);
+    if (!samples || count == 0) return 0;
+    double copy[kIOSPYUDPTelemetrySamples];
+    memcpy(copy, samples, sizeof(double) * count);
+    qsort(copy, count, sizeof(double), compareUDPMetricDouble);
+    q = fmin(1.0, fmax(0.0, q));
+    NSUInteger index = (NSUInteger)llround((double)(count - 1) * q);
+    return copy[MIN(index, count - 1)];
+}
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -49,6 +69,14 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
     uint32_t _udpFrameSequence;
     NSLock *_udpLock;
     CFAbsoluteTime _lastUDPKeyframeRequestTime;
+    uint64_t _udpTelemetryFrames;
+    uint64_t _udpTelemetryDatagrams;
+    uint64_t _udpTelemetryFailures;
+    uint64_t _udpTelemetryBytes;
+    double _udpTelemetrySendMsTotal;
+    double _udpTelemetrySendMsMax;
+    double _udpTelemetrySendMsSamples[kIOSPYUDPTelemetrySamples];
+    NSUInteger _udpTelemetrySendMsWrites;
 }
 
 + (instancetype)shared {
@@ -122,6 +150,7 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
     if (frame.length == 0 || frame.length > UINT32_MAX) {
         return NO;
     }
+    CFAbsoluteTime sendStartedAt = CFAbsoluteTimeGetCurrent();
     [_udpLock lock];
     if (_udpFd < 0 || _udpToken == 0) {
         [_udpLock unlock];
@@ -172,6 +201,10 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
         ssize_t sent = sendmsg(_udpFd, &message, MSG_DONTWAIT);
         if (sent < 0) {
             localSendFailures++;
+            _udpTelemetryFailures++;
+        } else {
+            _udpTelemetryDatagrams++;
+            _udpTelemetryBytes += (uint64_t)sent;
         }
     }
 
@@ -198,9 +231,21 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
     parityMessage.msg_namelen = sizeof(_udpPeer);
     parityMessage.msg_iov = parityIov;
     parityMessage.msg_iovlen = 2;
-    if (sendmsg(_udpFd, &parityMessage, MSG_DONTWAIT) < 0) {
+    ssize_t paritySent = sendmsg(_udpFd, &parityMessage, MSG_DONTWAIT);
+    if (paritySent < 0) {
         localSendFailures++;
+        _udpTelemetryFailures++;
+    } else {
+        _udpTelemetryDatagrams++;
+        _udpTelemetryBytes += (uint64_t)paritySent;
     }
+
+    double sendMs = (CFAbsoluteTimeGetCurrent() - sendStartedAt) * 1000.0;
+    _udpTelemetryFrames++;
+    _udpTelemetrySendMsTotal += sendMs;
+    _udpTelemetrySendMsMax = MAX(_udpTelemetrySendMsMax, sendMs);
+    _udpTelemetrySendMsSamples[_udpTelemetrySendMsWrites % kIOSPYUDPTelemetrySamples] = sendMs;
+    _udpTelemetrySendMsWrites++;
 
     [_udpLock unlock];
     // A single failed data datagram is still repairable if parity was sent. Two
@@ -276,6 +321,39 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
         close(client);
         NSLog(@"[ioscpyd] tweak detached from frame channel");
     }
+}
+
+- (NSData *)augmentStatsPayloadWithDaemonTelemetry:(NSData *)payload {
+    NSDictionary *raw = [NSJSONSerialization JSONObjectWithData:payload options:0 error:nil];
+    if (![raw isKindOfClass:[NSDictionary class]]) {
+        return payload;
+    }
+    NSMutableDictionary *augmented = [raw mutableCopy];
+    double udpAvg = _udpTelemetryFrames
+        ? _udpTelemetrySendMsTotal / (double)_udpTelemetryFrames : 0;
+    augmented[@"daemon_udp"] = @{
+        @"active": @([self hasLANVideoPeer]),
+        @"frames": @(_udpTelemetryFrames),
+        @"datagrams": @(_udpTelemetryDatagrams),
+        @"send_failures": @(_udpTelemetryFailures),
+        @"bytes": @(_udpTelemetryBytes),
+        @"frame_send_ms_avg": @(udpAvg),
+        @"frame_send_ms_p95": @(udpMetricPercentile(
+            _udpTelemetrySendMsSamples, _udpTelemetrySendMsWrites, 0.95)),
+        @"frame_send_ms_p99": @(udpMetricPercentile(
+            _udpTelemetrySendMsSamples, _udpTelemetrySendMsWrites, 0.99)),
+        @"frame_send_ms_max": @(_udpTelemetrySendMsMax),
+    };
+    NSData *encoded = [NSJSONSerialization dataWithJSONObject:augmented options:0 error:nil];
+
+    _udpTelemetryFrames = 0;
+    _udpTelemetryDatagrams = 0;
+    _udpTelemetryFailures = 0;
+    _udpTelemetryBytes = 0;
+    _udpTelemetrySendMsTotal = 0;
+    _udpTelemetrySendMsMax = 0;
+    _udpTelemetrySendMsWrites = 0;
+    return encoded ?: payload;
 }
 
 - (void)readFramesFrom:(int)fd {
@@ -356,13 +434,16 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
                     hostLock = _hostLock;
                 }
                 if (hostFd >= 0 && hostLock) {
+                    NSData *relayPayload = header.type == IOSPYMsgStats
+                        ? [self augmentStatsPayloadWithDaemonTelemetry:payload]
+                        : payload;
                     [hostLock lock];
                     // Non-blocking: clipboard and telemetry are best-effort and
                     // must never stall the tweak's capture path.
                     uint64_t channel = header.type == IOSPYMsgAudioFrame
                         ? IOSPY_CHANNEL_AUDIO : IOSPY_CHANNEL_CONTROL;
                     IOSPYTryWriteFrame(hostFd, (IOSPYMessageType)header.type,
-                                       channel, 0, payload);
+                                       channel, 0, relayPayload);
                     [hostLock unlock];
                 }
             }

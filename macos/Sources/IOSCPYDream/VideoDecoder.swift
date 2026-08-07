@@ -12,6 +12,7 @@ final class VideoDecoder: @unchecked Sendable {
 
     var onPixelBuffer: (@Sendable (PixelBufferEnvelope, Int, Int, Int) -> Void)?
     var onDecodeError: (@Sendable (String) -> Void)?
+    var onDecodeLatency: (@Sendable (Double) -> Void)?
 
     deinit { invalidate() }
 
@@ -110,7 +111,8 @@ final class VideoDecoder: @unchecked Sendable {
             owner: self,
             width: packet.width,
             height: packet.height,
-            orientation: packet.orientation
+            orientation: packet.orientation,
+            submittedAtNanos: DispatchTime.now().uptimeNanoseconds
         )
         let pointer = Unmanaged.passRetained(context).toOpaque()
         var infoFlags = VTDecodeInfoFlags()
@@ -246,6 +248,8 @@ final class VideoDecoder: @unchecked Sendable {
             context.owner.onDecodeError?("VideoToolbox 解码回调失败：\(status)")
             return
         }
+        let now = DispatchTime.now().uptimeNanoseconds
+        context.owner.onDecodeLatency?(Double(now &- context.submittedAtNanos) / 1_000_000)
         context.owner.onPixelBuffer?(PixelBufferEnvelope(imageBuffer), context.width, context.height, context.orientation)
     }
 }
@@ -267,6 +271,7 @@ final class VideoDecodePump: @unchecked Sendable {
 
     var onNeedKeyframe: (@Sendable () -> Void)?
     var onDroppedStaleChain: (@Sendable () -> Void)?
+    var onQueueTelemetry: (@Sendable (Double, Int) -> Void)?
 
     init(decoder: VideoDecoder, maxPendingFrames: Int = 12) {
         self.decoder = decoder
@@ -304,11 +309,18 @@ final class VideoDecodePump: @unchecked Sendable {
         }
 
         pendingFrames += 1
+        let pendingAtSubmit = pendingFrames
         currentGeneration = generation
+        let enqueuedAtNanos = DispatchTime.now().uptimeNanoseconds
         lock.unlock()
 
         queue.async { [weak self] in
             guard let self else { return }
+            let startedAtNanos = DispatchTime.now().uptimeNanoseconds
+            self.onQueueTelemetry?(
+                Double(startedAtNanos &- enqueuedAtNanos) / 1_000_000,
+                pendingAtSubmit
+            )
             self.lock.lock()
             let valid = self.generation == currentGeneration
             self.lock.unlock()
@@ -358,11 +370,13 @@ private final class DecodeContext {
     let width: Int
     let height: Int
     let orientation: Int
+    let submittedAtNanos: UInt64
 
-    init(owner: VideoDecoder, width: Int, height: Int, orientation: Int) {
+    init(owner: VideoDecoder, width: Int, height: Int, orientation: Int, submittedAtNanos: UInt64) {
         self.owner = owner
         self.width = width
         self.height = height
         self.orientation = orientation
+        self.submittedAtNanos = submittedAtNanos
     }
 }

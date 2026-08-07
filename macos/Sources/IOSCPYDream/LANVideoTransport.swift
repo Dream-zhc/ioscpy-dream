@@ -75,7 +75,13 @@ struct LANVideoTelemetry: Sendable {
     let lostFrames: UInt64
     let lateFrames: UInt64
     let frameReceiveMsAverage: Double
+    let frameReceiveMsP50: Double
+    let frameReceiveMsP95: Double
+    let frameReceiveMsP99: Double
     let frameReceiveMsMax: Double
+    let packetGapMsP95: Double
+    let packetGapMsP99: Double
+    let packetGapMsMax: Double
 }
 
 /// A no-jitter-buffer, newest-frame LAN video receiver.
@@ -109,6 +115,10 @@ final class LANVideoReceiver: @unchecked Sendable {
     private var telemetryFrameReceiveMsTotal: Double = 0
     private var telemetryFrameReceiveMsMax: Double = 0
     private var telemetryCompletedFrames: UInt64 = 0
+    private var telemetryFrameReceiveSamples: [Double] = []
+    private var telemetryPacketGapSamples: [Double] = []
+    private var telemetryPacketGapMsMax: Double = 0
+    private var telemetryLastPacketAtNanos: UInt64 = 0
 
     init() throws {
         let socketFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -214,6 +224,17 @@ final class LANVideoReceiver: @unchecked Sendable {
     }
 
     private func handleDatagram(_ datagram: Data) {
+        let packetNow = DispatchTime.now().uptimeNanoseconds
+        if telemetryLastPacketAtNanos > 0 {
+            let gapMs = Double(packetNow &- telemetryLastPacketAtNanos) / 1_000_000
+            telemetryPacketGapMsMax = max(telemetryPacketGapMsMax, gapMs)
+            // Thousands of packets/s do not need thousands of samples. Keep a
+            // bounded every-8th sample plus the exact maximum for jitter diagnosis.
+            if (telemetryPackets & 0x7) == 0, telemetryPacketGapSamples.count < 512 {
+                telemetryPacketGapSamples.append(gapMs)
+            }
+        }
+        telemetryLastPacketAtNanos = packetNow
         telemetryPackets &+= 1
         defer { emitTelemetryIfNeeded() }
         guard datagram.count >= LANVideoWire.headerSize,
@@ -277,6 +298,9 @@ final class LANVideoReceiver: @unchecked Sendable {
         telemetryFrameReceiveMsTotal += completionMs
         telemetryFrameReceiveMsMax = max(telemetryFrameReceiveMsMax, completionMs)
         telemetryCompletedFrames &+= 1
+        if telemetryFrameReceiveSamples.count < 256 {
+            telemetryFrameReceiveSamples.append(completionMs)
+        }
 
         if let last = lastDeliveredSequence {
             let delta = Int32(bitPattern: sequence &- last)
@@ -338,7 +362,13 @@ final class LANVideoReceiver: @unchecked Sendable {
             lateFrames: telemetryLate,
             frameReceiveMsAverage: telemetryCompletedFrames > 0
                 ? telemetryFrameReceiveMsTotal / Double(telemetryCompletedFrames) : 0,
-            frameReceiveMsMax: telemetryFrameReceiveMsMax
+            frameReceiveMsP50: percentile(telemetryFrameReceiveSamples, 0.50),
+            frameReceiveMsP95: percentile(telemetryFrameReceiveSamples, 0.95),
+            frameReceiveMsP99: percentile(telemetryFrameReceiveSamples, 0.99),
+            frameReceiveMsMax: telemetryFrameReceiveMsMax,
+            packetGapMsP95: percentile(telemetryPacketGapSamples, 0.95),
+            packetGapMsP99: percentile(telemetryPacketGapSamples, 0.99),
+            packetGapMsMax: telemetryPacketGapMsMax
         )
         telemetryStartedAt = now
         telemetryPackets = 0
@@ -348,6 +378,17 @@ final class LANVideoReceiver: @unchecked Sendable {
         telemetryFrameReceiveMsTotal = 0
         telemetryFrameReceiveMsMax = 0
         telemetryCompletedFrames = 0
+        telemetryFrameReceiveSamples.removeAll(keepingCapacity: true)
+        telemetryPacketGapSamples.removeAll(keepingCapacity: true)
+        telemetryPacketGapMsMax = 0
         onTelemetry?(sample)
     }
+}
+
+private func percentile(_ values: [Double], _ quantile: Double) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let q = min(max(quantile, 0), 1)
+    let index = Int((Double(sorted.count - 1) * q).rounded())
+    return sorted[min(max(index, 0), sorted.count - 1)]
 }

@@ -14,6 +14,8 @@
 #import <arpa/inet.h>
 #import <unistd.h>
 #import <UIKit/UIKit.h>
+#import <stdlib.h>
+#import <math.h>
 
 // JPEG fallback quality. Frame rate, dimensions, H.264 bitrate, and keyframe
 // interval are negotiated per stream through IOSPYStreamConfig.
@@ -21,6 +23,31 @@ static const CGFloat kQuality = 0.72;
 
 static double streamNowMs(void) {
     return CFAbsoluteTimeGetCurrent() * 1000.0;
+}
+
+static const NSUInteger kMetricSampleCapacity = 256;
+
+static void recordMetricSample(double *samples, NSUInteger *writes, double value) {
+    if (!samples || !writes || !isfinite(value) || value < 0) return;
+    samples[*writes % kMetricSampleCapacity] = value;
+    (*writes)++;
+}
+
+static int compareMetricDouble(const void *a, const void *b) {
+    double lhs = *(const double *)a;
+    double rhs = *(const double *)b;
+    return lhs < rhs ? -1 : (lhs > rhs ? 1 : 0);
+}
+
+static double metricPercentile(const double *samples, NSUInteger writes, double q) {
+    NSUInteger count = MIN(writes, kMetricSampleCapacity);
+    if (!samples || count == 0) return 0;
+    double copy[kMetricSampleCapacity];
+    memcpy(copy, samples, sizeof(double) * count);
+    qsort(copy, count, sizeof(double), compareMetricDouble);
+    q = fmin(1.0, fmax(0.0, q));
+    NSUInteger index = (NSUInteger)llround((double)(count - 1) * q);
+    return copy[MIN(index, count - 1)];
 }
 
 // clipboard sync bookkeeping (must hash byte-identically to the host)
@@ -90,10 +117,24 @@ static uint64_t clipHash(NSString *t) {
     double _captureMsMax;
     double _encodeMsMax;
     double _sendMsMax;
+    double _captureMsSamples[kMetricSampleCapacity];
+    double _encodeMsSamples[kMetricSampleCapacity];
+    double _sendMsSamples[kMetricSampleCapacity];
+    double _captureGapMsSamples[kMetricSampleCapacity];
+    NSUInteger _captureMsWrites;
+    NSUInteger _encodeMsWrites;
+    NSUInteger _sendMsWrites;
+    NSUInteger _captureGapMsWrites;
     double _lastCaptureTickMs;
     double _captureGapMsMax;
     NSUInteger _encodeInFlightMax;
     NSUInteger _sendBacklogMax;
+    NSLock *_inputStatsLock;
+    double _inputMainWaitSamples[kMetricSampleCapacity];
+    double _inputInjectMsSamples[kMetricSampleCapacity];
+    NSUInteger _inputMainWaitWrites;
+    NSUInteger _inputInjectMsWrites;
+    uint64_t _inputTouchEvents;
     BOOL _audioRequested;
     BOOL _blackScreen;
 }
@@ -120,6 +161,7 @@ static uint64_t clipHash(NSString *t) {
         _sendQueue = dispatch_queue_create("com.ioscpy.send", realtimeAttr);
         _clipQueue = dispatch_queue_create("com.ioscpy.clip", DISPATCH_QUEUE_SERIAL);
         _socketWriteLock = [[NSLock alloc] init];
+        _inputStatsLock = [[NSLock alloc] init];
         [self startClipboardObserver];
     }
     return self;
@@ -291,8 +333,21 @@ static uint64_t clipHash(NSString *t) {
             float x, y;
             memcpy(&x, &xb, 4);
             memcpy(&y, &yb, 4);
+            double queuedAtMs = streamNowMs();
             dispatch_async(dispatch_get_main_queue(), ^{
+                double dispatchAtMs = streamNowMs();
+                double injectStartMs = dispatchAtMs;
                 IOSPYInjectTouch((IOSPYTouchPhase)phase, fingerID, x, y);
+                double injectMs = streamNowMs() - injectStartMs;
+                [self->_inputStatsLock lock];
+                recordMetricSample(self->_inputMainWaitSamples,
+                                   &self->_inputMainWaitWrites,
+                                   dispatchAtMs - queuedAtMs);
+                recordMetricSample(self->_inputInjectMsSamples,
+                                   &self->_inputInjectMsWrites,
+                                   injectMs);
+                self->_inputTouchEvents++;
+                [self->_inputStatsLock unlock];
             });
         } else if (header.type == IOSPYMsgInputScroll && payload.length >= 28) {
             const uint8_t *b = (const uint8_t *)payload.bytes;
@@ -459,10 +514,19 @@ static uint64_t clipHash(NSString *t) {
     _captureMsMax = 0;
     _encodeMsMax = 0;
     _sendMsMax = 0;
+    _captureMsWrites = 0;
+    _encodeMsWrites = 0;
+    _sendMsWrites = 0;
+    _captureGapMsWrites = 0;
     _lastCaptureTickMs = 0;
     _captureGapMsMax = 0;
     _encodeInFlightMax = 0;
     _sendBacklogMax = 0;
+    [_inputStatsLock lock];
+    _inputMainWaitWrites = 0;
+    _inputInjectMsWrites = 0;
+    _inputTouchEvents = 0;
+    [_inputStatsLock unlock];
     _effectiveMaxDimension = _config.max_dimension;
     _effectiveBitrate = _config.bitrate_bps;
     _healthyStatsWindows = 0;
@@ -478,6 +542,37 @@ static uint64_t clipHash(NSString *t) {
     double captureAvg = _capturedFrames ? _captureMsTotal / _capturedFrames : 0;
     double encodeAvg = _encodedFrames ? _encodeMsTotal / _encodedFrames : 0;
     double sendAvg = _sentFrames ? _sendMsTotal / _sentFrames : 0;
+    double captureP50 = metricPercentile(_captureMsSamples, _captureMsWrites, 0.50);
+    double captureP95 = metricPercentile(_captureMsSamples, _captureMsWrites, 0.95);
+    double captureP99 = metricPercentile(_captureMsSamples, _captureMsWrites, 0.99);
+    double encodeP50 = metricPercentile(_encodeMsSamples, _encodeMsWrites, 0.50);
+    double encodeP95 = metricPercentile(_encodeMsSamples, _encodeMsWrites, 0.95);
+    double encodeP99 = metricPercentile(_encodeMsSamples, _encodeMsWrites, 0.99);
+    double sendP50 = metricPercentile(_sendMsSamples, _sendMsWrites, 0.50);
+    double sendP95 = metricPercentile(_sendMsSamples, _sendMsWrites, 0.95);
+    double sendP99 = metricPercentile(_sendMsSamples, _sendMsWrites, 0.99);
+    double captureGapP50 = metricPercentile(_captureGapMsSamples, _captureGapMsWrites, 0.50);
+    double captureGapP95 = metricPercentile(_captureGapMsSamples, _captureGapMsWrites, 0.95);
+    double captureGapP99 = metricPercentile(_captureGapMsSamples, _captureGapMsWrites, 0.99);
+    double inputMainWaitP50 = 0;
+    double inputMainWaitP95 = 0;
+    double inputMainWaitP99 = 0;
+    double inputInjectP50 = 0;
+    double inputInjectP95 = 0;
+    double inputInjectP99 = 0;
+    uint64_t inputTouchEvents = 0;
+    [_inputStatsLock lock];
+    inputMainWaitP50 = metricPercentile(_inputMainWaitSamples, _inputMainWaitWrites, 0.50);
+    inputMainWaitP95 = metricPercentile(_inputMainWaitSamples, _inputMainWaitWrites, 0.95);
+    inputMainWaitP99 = metricPercentile(_inputMainWaitSamples, _inputMainWaitWrites, 0.99);
+    inputInjectP50 = metricPercentile(_inputInjectMsSamples, _inputInjectMsWrites, 0.50);
+    inputInjectP95 = metricPercentile(_inputInjectMsSamples, _inputInjectMsWrites, 0.95);
+    inputInjectP99 = metricPercentile(_inputInjectMsSamples, _inputInjectMsWrites, 0.99);
+    inputTouchEvents = _inputTouchEvents;
+    _inputMainWaitWrites = 0;
+    _inputInjectMsWrites = 0;
+    _inputTouchEvents = 0;
+    [_inputStatsLock unlock];
     double frameBudget = 1000.0 / MAX(_config.target_fps, 1);
     double dropRatio = _captureTicks ? (double)_droppedFrames / _captureTicks : 0;
 
@@ -540,14 +635,33 @@ static uint64_t clipHash(NSString *t) {
         @"drop_transport": @(_dropTransport),
         @"drop_reference_chain": @(_dropReferenceChain),
         @"capture_ms_avg": @(captureAvg),
+        @"capture_ms_p50": @(captureP50),
+        @"capture_ms_p95": @(captureP95),
+        @"capture_ms_p99": @(captureP99),
         @"encode_ms_avg": @(encodeAvg),
+        @"encode_ms_p50": @(encodeP50),
+        @"encode_ms_p95": @(encodeP95),
+        @"encode_ms_p99": @(encodeP99),
         @"send_ms_avg": @(sendAvg),
+        @"send_ms_p50": @(sendP50),
+        @"send_ms_p95": @(sendP95),
+        @"send_ms_p99": @(sendP99),
         @"capture_ms_max": @(_captureMsMax),
         @"encode_ms_max": @(_encodeMsMax),
         @"send_ms_max": @(_sendMsMax),
+        @"capture_gap_ms_p50": @(captureGapP50),
+        @"capture_gap_ms_p95": @(captureGapP95),
+        @"capture_gap_ms_p99": @(captureGapP99),
         @"capture_gap_ms_max": @(_captureGapMsMax),
         @"encode_inflight_max": @(_encodeInFlightMax),
         @"send_backlog_max": @(_sendBacklogMax),
+        @"input_touch_events": @(inputTouchEvents),
+        @"input_main_wait_ms_p50": @(inputMainWaitP50),
+        @"input_main_wait_ms_p95": @(inputMainWaitP95),
+        @"input_main_wait_ms_p99": @(inputMainWaitP99),
+        @"input_inject_ms_p50": @(inputInjectP50),
+        @"input_inject_ms_p95": @(inputInjectP95),
+        @"input_inject_ms_p99": @(inputInjectP99),
         @"input": IOSPYInputDiagnostics() ?: @{},
     };
     NSData *body = [NSJSONSerialization dataWithJSONObject:stats options:0 error:nil];
@@ -578,6 +692,10 @@ static uint64_t clipHash(NSString *t) {
     _captureMsMax = 0;
     _encodeMsMax = 0;
     _sendMsMax = 0;
+    _captureMsWrites = 0;
+    _encodeMsWrites = 0;
+    _sendMsWrites = 0;
+    _captureGapMsWrites = 0;
     _captureGapMsMax = 0;
     _encodeInFlightMax = _h264InFlight;
     _sendBacklogMax = _sendBacklog;
@@ -590,7 +708,9 @@ static uint64_t clipHash(NSString *t) {
     }
     double tickNow = streamNowMs();
     if (_lastCaptureTickMs > 0) {
-        _captureGapMsMax = MAX(_captureGapMsMax, tickNow - _lastCaptureTickMs);
+        double gapMs = tickNow - _lastCaptureTickMs;
+        _captureGapMsMax = MAX(_captureGapMsMax, gapMs);
+        recordMetricSample(_captureGapMsSamples, &_captureGapMsWrites, gapMs);
     }
     _lastCaptureTickMs = tickNow;
     _captureTicks++;
@@ -712,6 +832,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     _capturedFrames++;
     _captureMsTotal += captureMs;
     _captureMsMax = MAX(_captureMsMax, captureMs);
+    recordMetricSample(_captureMsSamples, &_captureMsWrites, captureMs);
     int fps = MAX(_config.target_fps, 1);
     uint8_t submittedCodec = _codec;
     BOOL forceKeyframe = _needKeyframe;
@@ -761,6 +882,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
             self->_encodedFrames++;
             self->_encodeMsTotal += encodeMs;
             self->_encodeMsMax = MAX(self->_encodeMsMax, encodeMs);
+            recordMetricSample(self->_encodeMsSamples, &self->_encodeMsWrites, encodeMs);
             if (isKey) {
                 self->_needKeyframe = NO;
                 self->_dropUntilKeyframe = NO;
@@ -810,6 +932,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                     }
                     self->_sendMsTotal += sendMs;
                     self->_sendMsMax = MAX(self->_sendMsMax, sendMs);
+                    recordMetricSample(self->_sendMsSamples, &self->_sendMsWrites, sendMs);
                     if (sent) {
                         self->_sentFrames++;
                     } else {
