@@ -1,5 +1,4 @@
 import AppKit
-import CoreImage
 import CoreVideo
 import MetalKit
 
@@ -69,9 +68,10 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
 
     private let mailbox: VideoFrameMailbox
     private var renderedGeneration: UInt64 = 0
-    private var ciContext: CIContext!
     private var commandQueue: MTLCommandQueue!
-    private var colorSpace = CGColorSpaceCreateDeviceRGB()
+    private var textureCache: CVMetalTextureCache?
+    private var pipelineState: MTLRenderPipelineState!
+    private var lastDisplayMaximumFPS = 0
     private var marked = NSMutableAttributedString()
     private var selection = NSRange(location: 0, length: 0)
     private var homeSwipeStart: (x: Float, y: Float)?
@@ -81,7 +81,11 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
         self.mailbox = mailbox
         let selectedDevice = device ?? MTLCreateSystemDefaultDevice()
         super.init(frame: frameRect, device: selectedDevice)
-        framebufferOnly = false
+        // VideoToolbox already gives us IOSurface-backed NV12 buffers. Render
+        // their Y/UV planes directly through CVMetalTextureCache instead of the
+        // previous CIImage -> CoreImage -> Metal path, which telemetry showed
+        // taking ~14-16 ms at P95 and capping visible presentation near 60 FPS.
+        framebufferOnly = true
         enableSetNeedsDisplay = false
         isPaused = false
         autoResizeDrawable = true
@@ -90,12 +94,20 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
         wantsLayer = true
         clearColor = MTLClearColorMake(0.015, 0.015, 0.018, 1)
         delegate = self
+        if let metalLayer = layer as? CAMetalLayer {
+            // Two drawables keep presentation bounded to roughly one display
+            // interval instead of allowing an extra queued frame to hide input
+            // latency. Presentation remains synchronized to the physical panel.
+            metalLayer.maximumDrawableCount = 2
+            metalLayer.presentsWithTransaction = false
+            metalLayer.displaySyncEnabled = true
+        }
         if let selectedDevice {
-            ciContext = CIContext(mtlDevice: selectedDevice, options: [
-                .cacheIntermediates: false,
-                .priorityRequestLow: false,
-            ])
             commandQueue = selectedDevice.makeCommandQueue()
+            var cache: CVMetalTextureCache?
+            CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, selectedDevice, nil, &cache)
+            textureCache = cache
+            pipelineState = Self.makeNV12Pipeline(device: selectedDevice, pixelFormat: colorPixelFormat)
         }
         addTrackingArea(NSTrackingArea(
             rect: bounds,
@@ -113,40 +125,95 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     func draw(in view: MTKView) {
+        updateDisplayCadenceIfNeeded()
         guard let snapshot = mailbox.snapshot(after: renderedGeneration) else { return }
         let drawStartedAtNanos = DispatchTime.now().uptimeNanoseconds
         renderedGeneration = snapshot.generation
         let buffer = snapshot.buffer
         let orientation = snapshot.orientation
-        guard
+        guard CVPixelBufferGetPlaneCount(buffer) >= 2,
+              let textureCache,
+              let pipelineState,
               let drawable = currentDrawable,
+              let descriptor = currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
-        var image = CIImage(cvPixelBuffer: buffer)
-        switch orientation {
-        case 2: image = image.oriented(.down)
-        case 3: image = image.oriented(.right)
-        case 4: image = image.oriented(.left)
-        default: break
-        }
-        let extent = image.extent
-        guard extent.width > 0, extent.height > 0 else { return }
-        image = image.transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
-        let target = CGRect(origin: .zero, size: drawableSize)
-        let scale = min(target.width / extent.width, target.height / extent.height)
-        let scaledSize = CGSize(width: extent.width * scale, height: extent.height * scale)
-        let tx = (target.width - scaledSize.width) / 2
-        let ty = (target.height - scaledSize.height) / 2
-        image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-            .transformed(by: CGAffineTransform(translationX: tx, y: ty))
+        descriptor.colorAttachments[0].loadAction = .clear
+        descriptor.colorAttachments[0].storeAction = .store
+        descriptor.colorAttachments[0].clearColor = clearColor
 
-        ciContext.render(
-            image,
-            to: drawable.texture,
-            commandBuffer: commandBuffer,
-            bounds: target,
-            colorSpace: colorSpace
-        )
+        let yWidth = CVPixelBufferGetWidthOfPlane(buffer, 0)
+        let yHeight = CVPixelBufferGetHeightOfPlane(buffer, 0)
+        let uvWidth = CVPixelBufferGetWidthOfPlane(buffer, 1)
+        let uvHeight = CVPixelBufferGetHeightOfPlane(buffer, 1)
+        var yCVTexture: CVMetalTexture?
+        var uvCVTexture: CVMetalTexture?
+        guard CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            textureCache,
+            buffer,
+            nil,
+            .r8Unorm,
+            yWidth,
+            yHeight,
+            0,
+            &yCVTexture
+        ) == kCVReturnSuccess,
+        CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            textureCache,
+            buffer,
+            nil,
+            .rg8Unorm,
+            uvWidth,
+            uvHeight,
+            1,
+            &uvCVTexture
+        ) == kCVReturnSuccess,
+        let yCVTexture,
+        let uvCVTexture,
+        let yTexture = CVMetalTextureGetTexture(yCVTexture),
+        let uvTexture = CVMetalTextureGetTexture(uvCVTexture),
+        let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
+
+        let rotated = orientation == 3 || orientation == 4
+        let sourceWidth = CGFloat(rotated ? snapshot.height : snapshot.width)
+        let sourceHeight = CGFloat(rotated ? snapshot.width : snapshot.height)
+        let targetWidth = max(drawableSize.width, 1)
+        let targetHeight = max(drawableSize.height, 1)
+        let sourceAspect = sourceWidth / max(sourceHeight, 1)
+        let targetAspect = targetWidth / targetHeight
+        let viewport: MTLViewport
+        if targetAspect > sourceAspect {
+            let width = targetHeight * sourceAspect
+            viewport = MTLViewport(
+                originX: Double((targetWidth - width) * 0.5),
+                originY: 0,
+                width: Double(width),
+                height: Double(targetHeight),
+                znear: 0,
+                zfar: 1
+            )
+        } else {
+            let height = targetWidth / sourceAspect
+            viewport = MTLViewport(
+                originX: 0,
+                originY: Double((targetHeight - height) * 0.5),
+                width: Double(targetWidth),
+                height: Double(height),
+                znear: 0,
+                zfar: 1
+            )
+        }
+
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setViewport(viewport)
+        encoder.setFragmentTexture(yTexture, index: 0)
+        encoder.setFragmentTexture(uvTexture, index: 1)
+        var orientationValue = UInt32(orientation)
+        encoder.setFragmentBytes(&orientationValue, length: MemoryLayout<UInt32>.size, index: 0)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
         // Presentation telemetry must not enqueue another main-thread closure
@@ -157,6 +224,102 @@ final class MirrorMetalView: MTKView, MTKViewDelegate, @preconcurrency NSTextInp
         let frameAgeMs = Double(drawStartedAtNanos &- snapshot.publishedAtNanos) / 1_000_000
         let renderSubmitMs = Double(committedAtNanos &- drawStartedAtNanos) / 1_000_000
         onRenderTelemetry?(frameAgeMs, renderSubmitMs)
+    }
+
+    private func updateDisplayCadenceIfNeeded() {
+        let screen = window?.screen ?? NSScreen.main
+        let maximum = max(screen?.maximumFramesPerSecond ?? 60, 1)
+        guard maximum != lastDisplayMaximumFPS else { return }
+        lastDisplayMaximumFPS = maximum
+        preferredFramesPerSecond = min(120, maximum)
+        DiagnosticsLogger.shared.log("display_cadence", fields: [
+            "screen": screen?.localizedName ?? "unknown",
+            "display_refresh_hz": maximum,
+            "preferred_fps": preferredFramesPerSecond,
+            "drawable_width": drawableSize.width,
+            "drawable_height": drawableSize.height,
+        ])
+    }
+
+    private static func makeNV12Pipeline(
+        device: MTLDevice,
+        pixelFormat: MTLPixelFormat
+    ) -> MTLRenderPipelineState? {
+        let source = #"""
+        #include <metal_stdlib>
+        using namespace metal;
+
+        struct VertexOut {
+            float4 position [[position]];
+            float2 uv;
+        };
+
+        vertex VertexOut ioscpy_vertex(uint vertexID [[vertex_id]]) {
+            constexpr float2 positions[4] = {
+                float2(-1.0,  1.0),
+                float2( 1.0,  1.0),
+                float2(-1.0, -1.0),
+                float2( 1.0, -1.0)
+            };
+            constexpr float2 texcoords[4] = {
+                float2(0.0, 0.0),
+                float2(1.0, 0.0),
+                float2(0.0, 1.0),
+                float2(1.0, 1.0)
+            };
+            VertexOut out;
+            out.position = float4(positions[vertexID], 0.0, 1.0);
+            out.uv = texcoords[vertexID];
+            return out;
+        }
+
+        fragment float4 ioscpy_nv12_fragment(
+            VertexOut in [[stage_in]],
+            texture2d<float, access::sample> yTexture [[texture(0)]],
+            texture2d<float, access::sample> uvTexture [[texture(1)]],
+            constant uint &orientation [[buffer(0)]]) {
+            constexpr sampler s(address::clamp_to_edge, filter::linear);
+            float2 uv = in.uv;
+            if (orientation == 2) {
+                uv = float2(1.0 - uv.x, 1.0 - uv.y);
+            } else if (orientation == 3) {
+                uv = float2(uv.y, 1.0 - uv.x);
+            } else if (orientation == 4) {
+                uv = float2(1.0 - uv.y, uv.x);
+            }
+
+            // VideoToolbox is configured for bi-planar video-range NV12. Use a
+            // BT.709 video-range conversion, appropriate for iPhone display
+            // capture and much cheaper than a CoreImage render pass.
+            float y = yTexture.sample(s, uv).r;
+            float2 cbcr = uvTexture.sample(s, uv).rg - float2(0.5, 0.5);
+            float yy = max((y - (16.0 / 255.0)) * (255.0 / 219.0), 0.0);
+            float3 rgb;
+            rgb.r = yy + 1.5748 * cbcr.y;
+            rgb.g = yy - 0.1873 * cbcr.x - 0.4681 * cbcr.y;
+            rgb.b = yy + 1.8556 * cbcr.x;
+            return float4(clamp(rgb, 0.0, 1.0), 1.0);
+        }
+        """#
+
+        do {
+            let library = try device.makeLibrary(source: source, options: nil)
+            guard let vertex = library.makeFunction(name: "ioscpy_vertex"),
+                  let fragment = library.makeFunction(name: "ioscpy_nv12_fragment") else {
+                return nil
+            }
+            let descriptor = MTLRenderPipelineDescriptor()
+            descriptor.vertexFunction = vertex
+            descriptor.fragmentFunction = fragment
+            descriptor.colorAttachments[0].pixelFormat = pixelFormat
+            return try device.makeRenderPipelineState(descriptor: descriptor)
+        } catch {
+            DiagnosticsLogger.shared.logMessage(
+                "metal_pipeline_error",
+                "NV12 pipeline compile failed: \(error.localizedDescription)"
+            )
+            return nil
+        }
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}

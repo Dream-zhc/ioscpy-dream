@@ -9,12 +9,13 @@
 #import <sys/stat.h>
 #import <sys/time.h>
 #import <netinet/in.h>
+#import <netinet/ip.h>
 #import <netinet/tcp.h>
 #import <arpa/inet.h>
 #import <unistd.h>
 #import <errno.h>
 
-NSString *const IOSPYDaemonVersion = @"0.3.0-dream.7";
+NSString *const IOSPYDaemonVersion = @"0.3.0-dream.8";
 static NSString *const IOSPYTrustPath = @"/var/mobile/Library/Preferences/com.ioscpy.trust.plist";
 static const NSTimeInterval IOSPYTrustLifetime = 30.0 * 24.0 * 60.0 * 60.0;
 static const NSTimeInterval IOSPYPairingLifetime = 120.0;
@@ -117,6 +118,8 @@ static const NSTimeInterval IOSPYPairingLifetime = 120.0;
         }
         int yes = 1;
         setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+        int tos = IPTOS_LOWDELAY;
+        setsockopt(client, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
         // Don't let a stalled/half-open client wedge the single-threaded loop.
         struct timeval tv = {30, 0};
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));

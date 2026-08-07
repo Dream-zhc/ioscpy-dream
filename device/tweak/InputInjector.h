@@ -20,6 +20,11 @@ extern "C" {
 // foreground application ultimately consumed the event.
 BOOL IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y);
 
+// Dedicated serial USER_INTERACTIVE queue for HID event construction/dispatch.
+// Network input must not wait behind SpringBoard's UIKit main runloop; callers
+// that need synchronous timing telemetry can dispatch their work on this queue.
+dispatch_queue_t IOSPYInputRealtimeQueue(void);
+
 // Convert AppKit wheel/trackpad deltas into a continuously sampled synthetic
 // pan gesture. The internal 120 Hz integrator smooths coarse mouse-wheel
 // notches and preserves trackpad momentum without requiring the user to drag.

@@ -32,14 +32,30 @@ final class TCPTransport: @unchecked Sendable {
     }
 
     func start() async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let gate = ContinuationGate()
+            queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+                gate.resumeOnce {
+                    self?.connection.cancel()
+                    continuation.resume(throwing: ConnectionFailure.processFailed(
+                        "网络路径在 3 秒内没有变为可用状态"
+                    ))
+                }
+            }
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
                     gate.resumeOnce { continuation.resume() }
-                case .failed(let error), .waiting(let error):
+                case .failed(let error):
                     gate.resumeOnce { continuation.resume(throwing: error) }
+                case .waiting:
+                    // NWConnection commonly enters .waiting(.posix(ENETDOWN))
+                    // for a fraction of a second while Wi-Fi/path evaluation is
+                    // settling. Treat it as a recoverable state: Network.framework
+                    // will transition this same connection to .ready when the path
+                    // becomes usable instead of forcing the user to click Connect
+                    // repeatedly.
+                    break
                 case .cancelled:
                     gate.resumeOnce { continuation.resume(throwing: ConnectionFailure.disconnected) }
                 default:
@@ -283,6 +299,7 @@ final class IOSCPYSession: @unchecked Sendable {
     var onStats: (@Sendable (Data) -> Void)?
     var onRTT: (@Sendable (Double) -> Void)?
     var onLANVideoTelemetry: (@Sendable (LANVideoTelemetry) -> Void)?
+    var onVideoReferenceLoss: (@Sendable () -> Void)?
     var onRealtimeSendLatency: (@Sendable (Double) -> Void)?
     var onLog: (@Sendable (String) -> Void)?
     var onDisconnected: (@Sendable (Error?) -> Void)?
@@ -335,18 +352,37 @@ final class IOSCPYSession: @unchecked Sendable {
             port = UInt16(profile.lanPort)
         }
 
-        let transport = try TCPTransport(host: host, port: port)
-        do {
-            do {
-                try await transport.start()
-            } catch {
-                if mode == .lan {
-                    throw ConnectionFailure.processFailed(
-                        "无法连接 \(host):\(port)。请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.5 手机端。系统错误：\(error.localizedDescription)"
-                    )
+        let transport: TCPTransport
+        if mode == .lan {
+            let retryDelaysMs = [0, 200, 500, 1_000, 2_000]
+            var connectedTransport: TCPTransport?
+            var lastStartError: Error?
+            for delay in retryDelaysMs {
+                if delay > 0 {
+                    try await Task.sleep(for: .milliseconds(delay))
                 }
-                throw error
+                let candidate = try TCPTransport(host: host, port: port)
+                do {
+                    try await candidate.start()
+                    connectedTransport = candidate
+                    break
+                } catch {
+                    lastStartError = error
+                    candidate.cancel()
+                }
             }
+            guard let connectedTransport else {
+                throw ConnectionFailure.processFailed(
+                    "无法连接 \(host):\(port)。已自动等待并重试局域网路径；请确认 Mac 与 iPhone 在同一局域网、IP 正确，并已安装 dream.8 手机端。系统错误：\(lastStartError?.localizedDescription ?? "未知错误")"
+                )
+            }
+            transport = connectedTransport
+        } else {
+            let candidate = try TCPTransport(host: host, port: port)
+            try await candidate.start()
+            transport = candidate
+        }
+        do {
             let hello = HelloPayload(
                 nonce: randomHex(byteCount: 16),
                 hostID: hostID,
@@ -402,7 +438,7 @@ final class IOSCPYSession: @unchecked Sendable {
                 }
                 guard !liveCapabilities.streamBackends.isEmpty else {
                     throw ConnectionFailure.processFailed(
-                        "iPhone 的 SpringBoard 控制桥接尚未就绪。请确认 dream.7 手机端已安装；无需先打开旧版 App，等待几秒后重试即可。"
+                        "iPhone 的 SpringBoard 控制桥接尚未就绪。请确认 dream.8 手机端已安装；无需先打开旧版 App，等待几秒后会自动重试。"
                     )
                 }
             }
@@ -444,6 +480,7 @@ final class IOSCPYSession: @unchecked Sendable {
             self?.onVideo?(packet)
         }
         lanVideoReceiver?.onFrameLoss = { [weak self] in
+            self?.onVideoReferenceLoss?()
             self?.requestKeyframe()
         }
         lanVideoReceiver?.onTelemetry = { [weak self] telemetry in
@@ -723,7 +760,7 @@ final class IOSCPYSession: @unchecked Sendable {
     func requestKeyframe() {
         inputStateLock.lock()
         let now = DispatchTime.now().uptimeNanoseconds
-        let due = now &- lastKeyframeRequestNanos >= 500_000_000
+        let due = now &- lastKeyframeRequestNanos >= 300_000_000
         if due { lastKeyframeRequestNanos = now }
         inputStateLock.unlock()
         guard due else { return }

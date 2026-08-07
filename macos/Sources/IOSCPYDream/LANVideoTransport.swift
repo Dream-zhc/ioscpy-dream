@@ -6,7 +6,8 @@ import Foundation
 /// stall input behind TCP retransmission (head-of-line blocking).
 private enum LANVideoWire {
     static let magic: UInt32 = 0x4955_4450 // "IUDP"
-    static let version: UInt8 = 1
+    static let version: UInt8 = 2
+    static let legacyVersion: UInt8 = 1
     static let headerSize = 32
     // IPv4 LAN MTU is normally 1500 bytes. 1400 + 32-byte app header +
     // UDP/IPv4 headers = 1460, avoiding IP fragmentation while reducing packet
@@ -20,8 +21,14 @@ private final class LANFrameAssembly {
     let fragmentCount: Int
     let createdAtNanos: UInt64
     var fragments: [Data?]
-    var parity: Data?
+    struct ParityGroup {
+        let start: Int
+        let count: Int
+        let bytes: Data
+    }
+    var parityGroups: [Int: ParityGroup] = [:]
     var receivedCount = 0
+    var recoveredAny = false
 
     init(frameLength: Int, fragmentCount: Int, createdAtNanos: UInt64) {
         self.frameLength = frameLength
@@ -36,24 +43,41 @@ private final class LANFrameAssembly {
         receivedCount += 1
     }
 
-    func recoverSingleMissingWithParity() -> Bool {
-        guard receivedCount == fragmentCount - 1, let parity else { return false }
-        guard let missing = fragments.firstIndex(where: { $0 == nil }) else { return false }
-        var recovered = [UInt8](repeating: 0, count: parity.count)
-        parity.copyBytes(to: &recovered, count: parity.count)
-        for fragment in fragments.compactMap({ $0 }) {
-            fragment.withUnsafeBytes { raw in
-                let bytes = raw.bindMemory(to: UInt8.self)
-                let count = min(bytes.count, recovered.count)
-                for i in 0..<count { recovered[i] ^= bytes[i] }
+    func insertParity(start: Int, count: Int, payload: Data) {
+        guard start >= 0, count > 0, start + count <= fragmentCount else { return }
+        parityGroups[start] = ParityGroup(start: start, count: count, bytes: payload)
+    }
+
+    @discardableResult
+    func recoverMissingWithParityGroups() -> Int {
+        var recoveredFragments = 0
+        // Each v2 parity datagram covers a small contiguous group, so separate
+        // burst-loss regions can be repaired independently instead of one XOR
+        // packet protecting an entire 300-500 KB IDR. v1 maps to one full-frame
+        // group and remains compatible with dream.7 devices during upgrades.
+        for group in parityGroups.values {
+            let range = group.start..<(group.start + group.count)
+            let missing = range.filter { fragments[$0] == nil }
+            guard missing.count == 1, let missingIndex = missing.first else { continue }
+            var recovered = [UInt8](repeating: 0, count: group.bytes.count)
+            group.bytes.copyBytes(to: &recovered, count: group.bytes.count)
+            for index in range where index != missingIndex {
+                guard let fragment = fragments[index] else { continue }
+                fragment.withUnsafeBytes { raw in
+                    let bytes = raw.bindMemory(to: UInt8.self)
+                    let count = min(bytes.count, recovered.count)
+                    for i in 0..<count { recovered[i] ^= bytes[i] }
+                }
             }
+            let offset = missingIndex * LANVideoWire.maxFragmentPayload
+            let expected = min(LANVideoWire.maxFragmentPayload, max(0, frameLength - offset))
+            guard expected > 0, expected <= recovered.count else { continue }
+            fragments[missingIndex] = Data(recovered.prefix(expected))
+            receivedCount += 1
+            recoveredFragments += 1
+            recoveredAny = true
         }
-        let offset = missing * LANVideoWire.maxFragmentPayload
-        let expected = min(LANVideoWire.maxFragmentPayload, max(0, frameLength - offset))
-        guard expected > 0, expected <= recovered.count else { return false }
-        fragments[missing] = Data(recovered.prefix(expected))
-        receivedCount += 1
-        return true
+        return recoveredFragments
     }
 
     func completeData() -> Data? {
@@ -74,6 +98,7 @@ struct LANVideoTelemetry: Sendable {
     let recoveredFrames: UInt64
     let lostFrames: UInt64
     let lateFrames: UInt64
+    let latePackets: UInt64
     let frameReceiveMsAverage: Double
     let frameReceiveMsP50: Double
     let frameReceiveMsP95: Double
@@ -103,6 +128,7 @@ final class LANVideoReceiver: @unchecked Sendable {
     private var source: DispatchSourceRead?
     private var assemblies: [UInt32: LANFrameAssembly] = [:]
     private var lastDeliveredSequence: UInt32?
+    private var waitingForFreshKeyframe = true
     private var stopped = false
     private let deliveryLock = NSLock()
     private var deliveredFrames: UInt64 = 0
@@ -112,6 +138,7 @@ final class LANVideoReceiver: @unchecked Sendable {
     private var telemetryRecovered: UInt64 = 0
     private var telemetryLost: UInt64 = 0
     private var telemetryLate: UInt64 = 0
+    private var telemetryLatePackets: UInt64 = 0
     private var telemetryFrameReceiveMsTotal: Double = 0
     private var telemetryFrameReceiveMsMax: Double = 0
     private var telemetryCompletedFrames: UInt64 = 0
@@ -239,20 +266,34 @@ final class LANVideoReceiver: @unchecked Sendable {
         defer { emitTelemetryIfNeeded() }
         guard datagram.count >= LANVideoWire.headerSize,
               datagram.readBE(UInt32.self, at: 0) == LANVideoWire.magic,
-              datagram[4] == LANVideoWire.version,
+              (datagram[4] == LANVideoWire.version || datagram[4] == LANVideoWire.legacyVersion),
               Int(datagram.readBE(UInt16.self, at: 6)) == LANVideoWire.headerSize,
               datagram.readBE(UInt64.self, at: 8) == sessionToken else { return }
 
+        let wireVersion = datagram[4]
         let flags = datagram[5]
         let sequence = datagram.readBE(UInt32.self, at: 16)
         let frameLength = Int(datagram.readBE(UInt32.self, at: 20))
         let fragmentIndex = Int(datagram.readBE(UInt16.self, at: 24))
         let fragmentCount = Int(datagram.readBE(UInt16.self, at: 26))
         let payloadLength = Int(datagram.readBE(UInt16.self, at: 28))
+        let reserved = Int(datagram.readBE(UInt16.self, at: 30))
         guard frameLength >= 16, frameLength <= Wire.maxPayload,
               fragmentCount > 0, fragmentCount <= 4096,
               payloadLength >= 0,
               LANVideoWire.headerSize + payloadLength <= datagram.count else { return }
+
+        // Reject packets older than the newest sequence before allocating Data
+        // or an assembly. dream.7 rebuilt entire late frames (often even FEC-
+        // recovering them) only to discard them after completion, wasting CPU
+        // exactly when Wi-Fi was already jittering.
+        if let last = lastDeliveredSequence {
+            let delta = Int32(bitPattern: sequence &- last)
+            if delta <= 0 {
+                telemetryLatePackets &+= 1
+                return
+            }
+        }
 
         let now = DispatchTime.now().uptimeNanoseconds
         let assembly: LANFrameAssembly
@@ -283,16 +324,20 @@ final class LANVideoReceiver: @unchecked Sendable {
 
         let payload = datagram.subdata(in: LANVideoWire.headerSize..<(LANVideoWire.headerSize + payloadLength))
         if (flags & LANVideoWire.parityFlag) != 0 {
-            assembly.parity = payload
+            if wireVersion >= LANVideoWire.version, reserved > 0 {
+                assembly.insertParity(start: fragmentIndex, count: reserved, payload: payload)
+            } else {
+                assembly.insertParity(start: 0, count: fragmentCount, payload: payload)
+            }
         } else {
             assembly.insert(index: fragmentIndex, payload: payload)
         }
 
-        if assembly.receivedCount != fragmentCount,
-           assembly.recoverSingleMissingWithParity() {
-            telemetryRecovered &+= 1
+        if assembly.receivedCount != fragmentCount {
+            _ = assembly.recoverMissingWithParityGroups()
         }
         guard let body = assembly.completeData() else { return }
+        if assembly.recoveredAny { telemetryRecovered &+= 1 }
         assemblies.removeValue(forKey: sequence)
         let completionMs = Double(now &- assembly.createdAtNanos) / 1_000_000
         telemetryFrameReceiveMsTotal += completionMs
@@ -311,10 +356,10 @@ final class LANVideoReceiver: @unchecked Sendable {
                 return
             }
             if delta > 1 {
-                // A whole frame was not recoverable. Request an IDR, but continue
-                // feeding newer frames to VideoToolbox instead of freezing until
-                // the IDR arrives. Hardware concealment is far less disruptive
-                // than turning every tiny Wi-Fi loss into a 250-1000 ms stall.
+                // An HEVC/H.264 P-frame chain is no longer trustworthy after a
+                // missing encoded frame. Request a fresh IDR and suppress newer
+                // dependent frames until it arrives; feeding them into
+                // VideoToolbox produced long -12909 error storms in dream.7.
                 telemetryLost &+= UInt64(delta - 1)
                 noteLoss()
             }
@@ -324,11 +369,21 @@ final class LANVideoReceiver: @unchecked Sendable {
             noteLoss()
             return
         }
+        if waitingForFreshKeyframe {
+            guard packet.isKeyframe else { return }
+            waitingForFreshKeyframe = false
+        }
         deliveryLock.lock()
         deliveredFrames &+= 1
         lastDeliveredAtNanos = DispatchTime.now().uptimeNanoseconds
         deliveryLock.unlock()
         onVideo?(packet)
+
+        // Anything older than the just-delivered sequence is permanently stale.
+        // Remove it now so expiry cannot later generate a false loss/IDR request.
+        assemblies = assemblies.filter { candidate, _ in
+            Int32(bitPattern: candidate &- sequence) > 0
+        }
     }
 
     private func expireOldAssemblies() {
@@ -347,6 +402,7 @@ final class LANVideoReceiver: @unchecked Sendable {
     }
 
     private func noteLoss() {
+        waitingForFreshKeyframe = true
         onFrameLoss?()
     }
 
@@ -360,6 +416,7 @@ final class LANVideoReceiver: @unchecked Sendable {
             recoveredFrames: telemetryRecovered,
             lostFrames: telemetryLost,
             lateFrames: telemetryLate,
+            latePackets: telemetryLatePackets,
             frameReceiveMsAverage: telemetryCompletedFrames > 0
                 ? telemetryFrameReceiveMsTotal / Double(telemetryCompletedFrames) : 0,
             frameReceiveMsP50: percentile(telemetryFrameReceiveSamples, 0.50),
@@ -375,6 +432,7 @@ final class LANVideoReceiver: @unchecked Sendable {
         telemetryRecovered = 0
         telemetryLost = 0
         telemetryLate = 0
+        telemetryLatePackets = 0
         telemetryFrameReceiveMsTotal = 0
         telemetryFrameReceiveMsMax = 0
         telemetryCompletedFrames = 0

@@ -104,11 +104,12 @@ static IOSurfaceRef createBGRASurface(int width, int height) {
     return IOSurfaceCreate((__bridge CFDictionaryRef)props);
 }
 
-// High-resolution VideoToolbox sessions have several frames of pipeline latency
-// even when their throughput is capable of 120 FPS. Two slots artificially
-// capped the 2160p path around 50 FPS. Six slots let the hardware pipeline stay
-// full while StreamClient still bounds latency and drops stale work.
-static const int kCaptureSlotCount = 6;
+// Native-resolution HEVC can hold roughly six surfaces for ~45-50 ms while still
+// sustaining 120 submissions/s. A six-slot pool therefore had zero scheduling
+// margin and telemetry showed it pinning at 6/6 under motion, dropping 14-17
+// capture opportunities/s. Keep two bounded spare surfaces so transient encoder
+// service-time jitter does not turn into a hard ~100 FPS ceiling.
+static const int kCaptureSlotCount = 8;
 typedef struct {
     IOSurfaceRef source;
     IOSurfaceRef scaled;

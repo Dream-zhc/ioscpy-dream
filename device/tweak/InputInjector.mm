@@ -90,6 +90,21 @@ static volatile uint8_t gLastTouchPhase = 0xff;
 static volatile float gLastTouchX = 0.0f;
 static volatile float gLastTouchY = 0.0f;
 
+static dispatch_queue_t inputRealtimeQueue(void) {
+    static dispatch_queue_t queue = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+        queue = dispatch_queue_create("com.ioscpy.hid-realtime", attr);
+    });
+    return queue;
+}
+
+dispatch_queue_t IOSPYInputRealtimeQueue(void) {
+    return inputRealtimeQueue();
+}
+
 typedef CFArrayRef (*IOSPYCopyServicesFn)(IOHIDEventSystemClientRef);
 typedef Boolean (*IOSPYServiceConformsFn)(IOHIDServiceClientRef, uint32_t, uint32_t);
 typedef CFTypeRef (*IOSPYServiceRegistryIDFn)(IOHIDServiceClientRef);
@@ -397,7 +412,7 @@ BOOL IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
         // arrives, force one so the digitizer can't get stuck.
         uint64_t epoch = gTouchEpoch;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
+                       inputRealtimeQueue(), ^{
             if (gTouchBalance > 0 && gTouchEpoch == epoch) {
                 IOSPYInjectTouch(IOSPYTouchUp, 0, gLastX, gLastY);
             }
@@ -495,7 +510,7 @@ static void ensureScrollTimer(void) {
         return;
     }
     gScrollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                          dispatch_get_main_queue());
+                                          inputRealtimeQueue());
     uint64_t interval = NSEC_PER_SEC / 120;
     dispatch_source_set_timer(gScrollTimer, dispatch_time(DISPATCH_TIME_NOW, 0),
                               interval, interval / 4);
@@ -533,7 +548,7 @@ static void ensureScrollTimer(void) {
 
 void IOSPYInjectScroll(uint8_t phase, uint8_t momentumPhase, BOOL precise,
                        float deltaX, float deltaY, float x, float y) {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    dispatch_async(inputRealtimeQueue(), ^{
         ensureScrollTimer();
         gScrollLastInput = CFAbsoluteTimeGetCurrent();
         if (!gScrollActive && fabsf(gScrollPendingX) + fabsf(gScrollPendingY) < 0.0001f) {

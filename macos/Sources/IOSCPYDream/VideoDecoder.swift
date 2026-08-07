@@ -267,6 +267,7 @@ final class VideoDecodePump: @unchecked Sendable {
     private var pendingFrames = 0
     private var generation: UInt64 = 1
     private var waitingForKeyframe = true
+    private var resetDecoderBeforeNextKeyframe = true
     private var lastKeyframeRequestNanos: UInt64 = 0
 
     var onNeedKeyframe: (@Sendable () -> Void)?
@@ -281,6 +282,7 @@ final class VideoDecodePump: @unchecked Sendable {
     func submit(_ packet: VideoPacket) {
         var shouldRequestKeyframe = false
         var shouldReportDrop = false
+        var resetDecoder = false
         let currentGeneration: UInt64
 
         lock.lock()
@@ -292,6 +294,8 @@ final class VideoDecodePump: @unchecked Sendable {
         }
 
         if packet.isKeyframe {
+            resetDecoder = resetDecoderBeforeNextKeyframe
+            resetDecoderBeforeNextKeyframe = false
             waitingForKeyframe = false
         } else if pendingFrames >= maxPendingFrames {
             // Invalidate queued submissions logically. DispatchQueue work items
@@ -300,6 +304,7 @@ final class VideoDecodePump: @unchecked Sendable {
             generation &+= 1
             pendingFrames = 0
             waitingForKeyframe = true
+            resetDecoderBeforeNextKeyframe = true
             shouldRequestKeyframe = keyframeRequestDueLocked()
             shouldReportDrop = true
             lock.unlock()
@@ -311,6 +316,7 @@ final class VideoDecodePump: @unchecked Sendable {
         pendingFrames += 1
         let pendingAtSubmit = pendingFrames
         currentGeneration = generation
+        let shouldResetDecoder = resetDecoder
         let enqueuedAtNanos = DispatchTime.now().uptimeNanoseconds
         lock.unlock()
 
@@ -325,6 +331,9 @@ final class VideoDecodePump: @unchecked Sendable {
             let valid = self.generation == currentGeneration
             self.lock.unlock()
             if valid {
+                if shouldResetDecoder {
+                    self.decoder.invalidate()
+                }
                 self.decoder.decode(packet)
             }
             self.finish(generation: currentGeneration)
@@ -336,9 +345,38 @@ final class VideoDecodePump: @unchecked Sendable {
         generation &+= 1
         pendingFrames = 0
         waitingForKeyframe = true
+        resetDecoderBeforeNextKeyframe = true
         lastKeyframeRequestNanos = 0
         lock.unlock()
         queue.async { [decoder] in decoder.invalidate() }
+    }
+
+    /// Mark the current inter-frame reference chain unusable (for example after
+    /// an unrecoverable UDP sequence gap or a VideoToolbox decode error). Pending
+    /// work becomes a no-op and dependent P-frames are ignored until the next
+    /// IDR. The decoder is invalidated immediately before that IDR on the same
+    /// serial queue so stale asynchronous callbacks cannot race the fresh chain.
+    func breakReferenceChain() {
+        var shouldRequestKeyframe = false
+        var changed = false
+        lock.lock()
+        if !waitingForKeyframe || pendingFrames > 0 {
+            generation &+= 1
+            pendingFrames = 0
+            waitingForKeyframe = true
+            // Enqueue invalidation before releasing the state lock. Any fresh
+            // keyframe submit must acquire this same lock first, so its decode
+            // work is guaranteed to enter the serial queue after invalidation.
+            // This stops stale asynchronous output from a broken HEVC reference
+            // chain instead of letting -12909 callbacks continue until the IDR.
+            queue.async { [decoder] in decoder.invalidate() }
+            resetDecoderBeforeNextKeyframe = false
+            changed = true
+        }
+        shouldRequestKeyframe = keyframeRequestDueLocked()
+        lock.unlock()
+        if changed { onDroppedStaleChain?() }
+        if shouldRequestKeyframe { onNeedKeyframe?() }
     }
 
     private func finish(generation completedGeneration: UInt64) {
@@ -351,7 +389,7 @@ final class VideoDecodePump: @unchecked Sendable {
 
     private func keyframeRequestDueLocked() -> Bool {
         let now = DispatchTime.now().uptimeNanoseconds
-        guard now &- lastKeyframeRequestNanos >= 500_000_000 else { return false }
+        guard now &- lastKeyframeRequestNanos >= 300_000_000 else { return false }
         lastKeyframeRequestNanos = now
         return true
     }

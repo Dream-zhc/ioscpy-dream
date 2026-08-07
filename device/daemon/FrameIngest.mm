@@ -13,14 +13,25 @@
 #import <errno.h>
 #import <math.h>
 #import <stdlib.h>
+#import <mach/mach_time.h>
 
 static const uint32_t kIOSPYLANVideoMagic = 0x49554450u; // "IUDP"
-static const uint8_t kIOSPYLANVideoVersion = 1;
+static const uint8_t kIOSPYLANVideoVersion = 2;
 static const uint8_t kIOSPYLANVideoParityFlag = 0x01;
 // Standard IPv4 LAN MTU is 1500. 1400 data + 32 app + 28 UDP/IP = 1460,
 // avoiding IP fragmentation while keeping packet rate lower at 120 FPS.
 static const size_t kIOSPYLANVideoFragmentPayload = 1400;
+static const size_t kIOSPYLANVideoFECGroup = 12;
+static const size_t kIOSPYLANVideoKeyframeFECGroup = 4;
 static const NSUInteger kIOSPYUDPTelemetrySamples = 256;
+
+static uint64_t machTicksForNanoseconds(uint64_t nanoseconds) {
+    static mach_timebase_info_data_t info = {};
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&info); });
+    if (info.numer == 0) return nanoseconds;
+    return (uint64_t)((__uint128_t)nanoseconds * info.denom / info.numer);
+}
 
 static int compareUDPMetricDouble(const void *a, const void *b) {
     double lhs = *(const double *)a;
@@ -73,6 +84,8 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
     uint64_t _udpTelemetryDatagrams;
     uint64_t _udpTelemetryFailures;
     uint64_t _udpTelemetryBytes;
+    uint64_t _udpTelemetryFECDatagrams;
+    double _udpTelemetryPacedMsTotal;
     double _udpTelemetrySendMsTotal;
     double _udpTelemetrySendMsMax;
     double _udpTelemetrySendMsSamples[kIOSPYUDPTelemetrySamples];
@@ -167,31 +180,44 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
     }
     uint16_t fragmentCount = (uint16_t)fragmentCountSize;
     uint32_t sequence = ++_udpFrameSequence;
-    uint8_t parity[kIOSPYLANVideoFragmentPayload] = {};
-    int localSendFailures = 0;
+    __block int localSendFailures = 0;
 
-    for (uint16_t index = 0; index < fragmentCount; index++) {
-        size_t offset = (size_t)index * kIOSPYLANVideoFragmentPayload;
-        size_t length = MIN(kIOSPYLANVideoFragmentPayload, frameLength - offset);
-        for (size_t i = 0; i < length; i++) {
-            parity[i] ^= bytes[offset + i];
-        }
+    uint32_t videoFlags = 0;
+    if (frameLength >= 12) {
+        uint32_t flagsBE = 0;
+        memcpy(&flagsBE, bytes + 8, sizeof(flagsBE));
+        videoFlags = ntohl(flagsBE);
+    }
+    BOOL keyframe = (videoFlags & IOSPY_VIDEO_FLAG_KEYFRAME) != 0;
+    size_t fecGroupSize = keyframe ? kIOSPYLANVideoKeyframeFECGroup
+                                   : kIOSPYLANVideoFECGroup;
+    size_t groupCount = (fragmentCountSize + fecGroupSize - 1) / fecGroupSize;
+    // Spread only multi-group frames. Small P-frames stay effectively zero-latency;
+    // motion frames are smoothed across 6 ms and large IDRs across 12 ms instead
+    // of dumping thousands of datagrams into the Wi-Fi queue in one burst.
+    uint64_t pacingWindowNs = keyframe ? 12ull * NSEC_PER_MSEC : 6ull * NSEC_PER_MSEC;
+    uint64_t pacingStart = mach_absolute_time();
+    double pacedWaitMs = 0;
 
+    BOOL (^sendDatagram)(uint8_t, uint16_t, uint16_t, const void *, size_t) =
+        ^BOOL(uint8_t packetFlags, uint16_t fragmentIndex, uint16_t parityGroupCount,
+              const void *payloadBytes, size_t payloadLength) {
         IOSPYLANVideoHeader header = {};
         header.magic = htonl(kIOSPYLANVideoMagic);
         header.version = kIOSPYLANVideoVersion;
-        header.flags = 0;
+        header.flags = packetFlags;
         header.headerSize = htons((uint16_t)sizeof(header));
         header.token = CFSwapInt64HostToBig(_udpToken);
         header.frameSequence = htonl(sequence);
         header.frameLength = htonl((uint32_t)frameLength);
-        header.fragmentIndex = htons(index);
+        header.fragmentIndex = htons(fragmentIndex);
         header.fragmentCount = htons(fragmentCount);
-        header.payloadLength = htons((uint16_t)length);
+        header.payloadLength = htons((uint16_t)payloadLength);
+        header.reserved = htons(parityGroupCount);
 
         struct iovec iov[2] = {
             {&header, sizeof(header)},
-            {(void *)(bytes + offset), length},
+            {(void *)payloadBytes, payloadLength},
         };
         struct msghdr message = {};
         message.msg_name = &_udpPeer;
@@ -202,55 +228,70 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
         if (sent < 0) {
             localSendFailures++;
             _udpTelemetryFailures++;
+            return NO;
         } else {
             _udpTelemetryDatagrams++;
             _udpTelemetryBytes += (uint64_t)sent;
+            if ((packetFlags & kIOSPYLANVideoParityFlag) != 0) {
+                _udpTelemetryFECDatagrams++;
+            }
+            return YES;
         }
-    }
-
-    // One parity packet repairs any single missing data fragment in this frame.
-    // This avoids an IDR storm from tiny Wi-Fi loss without introducing a jitter
-    // buffer or retransmission delay.
-    IOSPYLANVideoHeader parityHeader = {};
-    parityHeader.magic = htonl(kIOSPYLANVideoMagic);
-    parityHeader.version = kIOSPYLANVideoVersion;
-    parityHeader.flags = kIOSPYLANVideoParityFlag;
-    parityHeader.headerSize = htons((uint16_t)sizeof(parityHeader));
-    parityHeader.token = CFSwapInt64HostToBig(_udpToken);
-    parityHeader.frameSequence = htonl(sequence);
-    parityHeader.frameLength = htonl((uint32_t)frameLength);
-    parityHeader.fragmentIndex = htons(fragmentCount);
-    parityHeader.fragmentCount = htons(fragmentCount);
-    parityHeader.payloadLength = htons((uint16_t)sizeof(parity));
-    struct iovec parityIov[2] = {
-        {&parityHeader, sizeof(parityHeader)},
-        {parity, sizeof(parity)},
     };
-    struct msghdr parityMessage = {};
-    parityMessage.msg_name = &_udpPeer;
-    parityMessage.msg_namelen = sizeof(_udpPeer);
-    parityMessage.msg_iov = parityIov;
-    parityMessage.msg_iovlen = 2;
-    ssize_t paritySent = sendmsg(_udpFd, &parityMessage, MSG_DONTWAIT);
-    if (paritySent < 0) {
-        localSendFailures++;
-        _udpTelemetryFailures++;
-    } else {
-        _udpTelemetryDatagrams++;
-        _udpTelemetryBytes += (uint64_t)paritySent;
+
+    for (size_t group = 0; group < groupCount; group++) {
+        size_t groupStart = group * fecGroupSize;
+        size_t groupEnd = MIN(fragmentCountSize, groupStart + fecGroupSize);
+        uint16_t parityDataCount = (uint16_t)(groupEnd - groupStart);
+        uint8_t parity[kIOSPYLANVideoFragmentPayload] = {};
+
+        for (size_t rawIndex = groupStart; rawIndex < groupEnd; rawIndex++) {
+            uint16_t index = (uint16_t)rawIndex;
+            size_t offset = rawIndex * kIOSPYLANVideoFragmentPayload;
+            size_t length = MIN(kIOSPYLANVideoFragmentPayload, frameLength - offset);
+            for (size_t i = 0; i < length; i++) {
+                parity[i] ^= bytes[offset + i];
+            }
+            sendDatagram(0, index, 0, bytes + offset, length);
+        }
+
+        // One XOR parity per small group repairs one loss in every 4 keyframe
+        // fragments (or every 12 P-frame fragments), dramatically improving IDR
+        // recovery without retransmission/jitter buffering.
+        sendDatagram(kIOSPYLANVideoParityFlag, (uint16_t)groupStart,
+                     parityDataCount, parity, sizeof(parity));
+
+        if (group + 1 < groupCount && groupCount > 1) {
+            uint64_t targetNs = pacingWindowNs * (group + 1) / groupCount;
+            uint64_t target = pacingStart + machTicksForNanoseconds(targetNs);
+            uint64_t before = mach_absolute_time();
+            if (target > before) {
+                mach_wait_until(target);
+                uint64_t after = mach_absolute_time();
+                static mach_timebase_info_data_t info = {};
+                static dispatch_once_t once;
+                dispatch_once(&once, ^{ mach_timebase_info(&info); });
+                if (info.denom != 0) {
+                    pacedWaitMs += (double)(after - before) * (double)info.numer /
+                                   (double)info.denom / 1e6;
+                }
+            }
+        }
     }
 
     double sendMs = (CFAbsoluteTimeGetCurrent() - sendStartedAt) * 1000.0;
     _udpTelemetryFrames++;
+    _udpTelemetryPacedMsTotal += pacedWaitMs;
     _udpTelemetrySendMsTotal += sendMs;
     _udpTelemetrySendMsMax = MAX(_udpTelemetrySendMsMax, sendMs);
     _udpTelemetrySendMsSamples[_udpTelemetrySendMsWrites % kIOSPYUDPTelemetrySamples] = sendMs;
     _udpTelemetrySendMsWrites++;
 
     [_udpLock unlock];
-    // A single failed data datagram is still repairable if parity was sent. Two
-    // or more local failures make this frame unrecoverable.
-    return localSendFailures <= 1;
+    // Local EAGAIN/ENOBUFS means the kernel queue itself was pressured. Group FEC
+    // may repair it, but request a fresh IDR conservatively rather than assuming
+    // which parity group was affected.
+    return localSendFailures == 0;
 }
 
 - (void)setHostFd:(int)fd writeLock:(NSLock *)lock {
@@ -337,6 +378,8 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
         @"datagrams": @(_udpTelemetryDatagrams),
         @"send_failures": @(_udpTelemetryFailures),
         @"bytes": @(_udpTelemetryBytes),
+        @"fec_datagrams": @(_udpTelemetryFECDatagrams),
+        @"paced_wait_ms": @(_udpTelemetryPacedMsTotal),
         @"frame_send_ms_avg": @(udpAvg),
         @"frame_send_ms_p95": @(udpMetricPercentile(
             _udpTelemetrySendMsSamples, _udpTelemetrySendMsWrites, 0.95)),
@@ -350,6 +393,8 @@ static_assert(sizeof(IOSPYLANVideoHeader) == 32, "LAN video header must remain 3
     _udpTelemetryDatagrams = 0;
     _udpTelemetryFailures = 0;
     _udpTelemetryBytes = 0;
+    _udpTelemetryFECDatagrams = 0;
+    _udpTelemetryPacedMsTotal = 0;
     _udpTelemetrySendMsTotal = 0;
     _udpTelemetrySendMsMax = 0;
     _udpTelemetrySendMsWrites = 0;

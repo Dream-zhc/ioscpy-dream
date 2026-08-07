@@ -334,7 +334,7 @@ static uint64_t clipHash(NSString *t) {
             memcpy(&x, &xb, 4);
             memcpy(&y, &yb, 4);
             double queuedAtMs = streamNowMs();
-            dispatch_async(dispatch_get_main_queue(), ^{
+            dispatch_async(IOSPYInputRealtimeQueue(), ^{
                 double dispatchAtMs = streamNowMs();
                 double injectStartMs = dispatchAtMs;
                 IOSPYInjectTouch((IOSPYTouchPhase)phase, fingerID, x, y);
@@ -656,6 +656,10 @@ static uint64_t clipHash(NSString *t) {
         @"encode_inflight_max": @(_encodeInFlightMax),
         @"send_backlog_max": @(_sendBacklogMax),
         @"input_touch_events": @(inputTouchEvents),
+        @"input_queue_wait_ms_p50": @(inputMainWaitP50),
+        @"input_queue_wait_ms_p95": @(inputMainWaitP95),
+        @"input_queue_wait_ms_p99": @(inputMainWaitP99),
+        // Legacy keys retained for one release so older log parsers still work.
         @"input_main_wait_ms_p50": @(inputMainWaitP50),
         @"input_main_wait_ms_p95": @(inputMainWaitP95),
         @"input_main_wait_ms_p99": @(inputMainWaitP99),
@@ -807,7 +811,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     // callback may arrive ~35-45 ms later while still accepting a new frame every
     // 8.3 ms. Two in-flight frames therefore capped throughput near 50 FPS.
     // Keep enough slots to fill the pipeline, but never allow an unbounded queue.
-    NSUInteger maxInFlight = _config.target_fps >= 100 ? 6 :
+    NSUInteger maxInFlight = _config.target_fps >= 100 ? 8 :
                              (_config.target_fps >= 80 ? 5 : 4);
     if (_h264InFlight >= maxInFlight) {
         _droppedFrames++;

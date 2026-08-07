@@ -213,10 +213,10 @@ final class AppModel: ObservableObject {
         let decoder = self.decoder
         let decodePump = self.decodePump
         let counters = performanceCounters
-        decoder.onDecodeError = { [weak connected] error in
+        decoder.onDecodeError = { error in
             NSLog("[ioscpy] decode: %@", error)
             DiagnosticsLogger.shared.logMessage("decode_error", error)
-            connected?.requestKeyframe()
+            decodePump.breakReferenceChain()
         }
         decodePump.onNeedKeyframe = { [weak connected] in connected?.requestKeyframe() }
         decodePump.onDroppedStaleChain = {
@@ -229,6 +229,9 @@ final class AppModel: ObservableObject {
         connected.onVideo = { packet in
             counters.recordReceived(bytes: packet.bytes.count)
             decodePump.submit(packet)
+        }
+        connected.onVideoReferenceLoss = {
+            decodePump.breakReferenceChain()
         }
         connected.onStats = { data in
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
@@ -311,6 +314,7 @@ final class AppModel: ObservableObject {
                 "recovered_frames": sample.recoveredFrames,
                 "lost_frames": sample.lostFrames,
                 "late_frames": sample.lateFrames,
+                "late_packets": sample.latePackets,
                 "frame_rx_ms_avg": sample.frameReceiveMsAverage,
                 "frame_rx_ms_p50": sample.frameReceiveMsP50,
                 "frame_rx_ms_p95": sample.frameReceiveMsP95,
